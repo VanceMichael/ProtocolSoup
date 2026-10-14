@@ -40,6 +40,8 @@ type MockIdP struct {
 	accessJTIsByUser     map[string][]string
 	deviceAuthByCode     map[string]*DeviceAuthorization
 	deviceAuthByUserCode map[string]*DeviceAuthorization
+	inflight             map[string]*inflightGrant // exclusive claims held while a grant exchange is being prepared
+	faultHook            FaultHook                 // test-only phased fault injection
 	keySet               *crypto.KeySet
 	jwtService           *crypto.JWTService
 	issuer               string
@@ -52,7 +54,8 @@ type MockIdP struct {
 // redeemed, together with the tokens minted from it. RFC 6749 Section 4.1.2
 // requires the OP to deny a replayed code (MUST) and to revoke the tokens
 // previously issued from that code (SHOULD); retaining this record lets the OP
-// do both when the same code is presented a second time.
+// do both when the same code is presented a second time. The record is written
+// atomically by Redemption.Commit when the code is finally consumed.
 type usedAuthorizationCode struct {
 	accessTokenJTIs []string
 	refreshTokens   []string
@@ -106,6 +109,7 @@ func NewMockIdP(keySet *crypto.KeySet) *MockIdP {
 		accessJTIsByUser:     make(map[string][]string),
 		deviceAuthByCode:     make(map[string]*DeviceAuthorization),
 		deviceAuthByUserCode: make(map[string]*DeviceAuthorization),
+		inflight:             make(map[string]*inflightGrant),
 		keySet:               keySet,
 		issuer:               "http://localhost:8080",
 		pairwiseSalt:         pairwiseSalt,
@@ -742,8 +746,9 @@ func (idp *MockIdP) BindAuthorizationCodeIssuerState(code, issuerState string) e
 
 // GetAuthorizationCode returns a defensive copy of a live authorization code
 // without consuming it. Protocol extensions use this only to select the
-// security policy that must be applied before redemption; ValidateAuthorizationCode
-// remains the sole operation that validates and atomically consumes the code.
+// security policy that must be applied before redemption;
+// BeginAuthorizationCodeRedemption is the sole operation that validates and,
+// once the whole token response is prepared, finally consumes the code.
 func (idp *MockIdP) GetAuthorizationCode(code string) (*models.AuthorizationCode, bool) {
 	idp.mu.RLock()
 	defer idp.mu.RUnlock()
@@ -754,108 +759,6 @@ func (idp *MockIdP) GetAuthorizationCode(code string) (*models.AuthorizationCode
 	copy := *authCode
 	copy.CredentialConfigurationIDs = append([]string(nil), authCode.CredentialConfigurationIDs...)
 	return &copy, true
-}
-
-// ValidateAuthorizationCode validates and consumes an authorization code
-func (idp *MockIdP) ValidateAuthorizationCode(code, clientID, redirectURI, codeVerifier string) (*models.AuthorizationCode, error) {
-	idp.mu.Lock()
-	defer idp.mu.Unlock()
-
-	idp.pruneUsedCodesLocked()
-
-	authCode, exists := idp.authCodes[code]
-	if !exists {
-		// RFC 6749 Section 4.1.2: an authorization code presented more than once
-		// MUST be denied, and the OP SHOULD revoke the tokens it previously issued
-		// from that code. A code that is gone from authCodes but recorded in
-		// usedCodes is exactly such a replay, so the access tokens it minted are
-		// revoked (by JTI) and any refresh token dropped before the denial.
-		if used, replayed := idp.usedCodes[code]; replayed {
-			for _, jti := range used.accessTokenJTIs {
-				idp.revokedTokens[jti] = time.Now()
-			}
-			for _, rt := range used.refreshTokens {
-				delete(idp.refreshTokens, rt)
-			}
-			return nil, errors.New("authorization code already used")
-		}
-		return nil, errors.New("invalid authorization code")
-	}
-
-	// Reject expired codes before consuming them (RFC 6749 §4.1.2;
-	// FAPI2 SP Final §5.3.2.1-11 caps lifetime at AuthorizationCodeTTL).
-	if !authCode.ExpiresAt.After(time.Now()) {
-		delete(idp.authCodes, code)
-		return nil, errors.New("authorization code expired")
-	}
-
-	// Bind the code to the issuing client and redirect_uri before consuming
-	// it. A mismatched client must not burn the legitimate client's code
-	// (OIDCC §3.1.3.4 / FAPI2 SP §5.3.2.1).
-	if authCode.ClientID != clientID {
-		return nil, errors.New("client ID mismatch")
-	}
-
-	if authCode.RedirectURI != redirectURI {
-		return nil, errors.New("redirect URI mismatch")
-	}
-
-	// Validate PKCE if code challenge was provided (RFC 7636)
-	if authCode.CodeChallenge != "" {
-		if err := ValidatePKCEWithError(codeVerifier, authCode.CodeChallenge, authCode.CodeChallengeMethod); err != nil {
-			// Return specific PKCE error for RFC 7636 compliance
-			return nil, err
-		}
-	}
-
-	// Consume only after every binding check succeeds (one-time use).
-	delete(idp.authCodes, code)
-
-	// Remember the redeemed code so a later replay is detected and the tokens it
-	// produces can be revoked (RFC 6749 Section 4.1.2). RecordIssuedTokens fills
-	// in the token identifiers once issuance succeeds; recording the code here
-	// (rather than at issuance) closes the window between consumption and
-	// issuance during which a concurrent replay could otherwise slip through.
-	idp.usedCodes[code] = &usedAuthorizationCode{usedAt: time.Now()}
-
-	return authCode, nil
-}
-
-// RecordIssuedTokens binds the tokens minted from an authorization code to that
-// code's replay-detection record. If the code is later replayed,
-// ValidateAuthorizationCode revokes exactly these tokens (RFC 6749 Section
-// 4.1.2). Calling it with an empty code is a no-op, so test fixtures that build
-// an AuthorizationCode without a Code value are unaffected.
-func (idp *MockIdP) RecordIssuedTokens(code, accessToken, refreshToken string) {
-	if code == "" {
-		return
-	}
-
-	// Resolve the access token's JTI so the exact token can be revoked later;
-	// revocation is tracked by JTI to match RevokeAccessToken/IsTokenRevoked.
-	// ValidateToken does not touch idp state, so it is safe before the lock.
-	jti := accessToken
-	if claims, err := idp.jwtService.ValidateToken(accessToken); err == nil {
-		if v, ok := claims["jti"].(string); ok && v != "" {
-			jti = v
-		}
-	}
-
-	idp.mu.Lock()
-	defer idp.mu.Unlock()
-	used, ok := idp.usedCodes[code]
-	if !ok {
-		// The record was pruned (or never created); recreate it so a replay can
-		// still revoke this token.
-		used = &usedAuthorizationCode{usedAt: time.Now()}
-		idp.usedCodes[code] = used
-	}
-	if jti != "" {
-		used.accessTokenJTIs = append(used.accessTokenJTIs, jti)
-	}
-	if refreshToken != "" {
-		used.refreshTokens = append(used.refreshTokens, refreshToken)
-	}
 }
 
 // pruneUsedCodesLocked drops redeemed-code records older than usedCodeRetention.
@@ -1002,7 +905,7 @@ func (idp *MockIdP) BindRefreshTokenClientInstanceKey(token, instanceJKT string)
 
 // GetRefreshToken returns a defensive copy of a live refresh token without
 // consuming it. Binding checks (DPoP jkt, Client Instance Key) run against
-// this snapshot before ValidateRefreshToken rotates the token.
+// this snapshot before BeginRefreshTokenRedemption rotates the token.
 func (idp *MockIdP) GetRefreshToken(token string) (*models.RefreshToken, bool) {
 	idp.mu.RLock()
 	defer idp.mu.RUnlock()
@@ -1015,33 +918,6 @@ func (idp *MockIdP) GetRefreshToken(token string) (*models.RefreshToken, bool) {
 	}
 	copy := *rt
 	return &copy, true
-}
-
-// ValidateRefreshToken validates a refresh token
-func (idp *MockIdP) ValidateRefreshToken(token, clientID string) (*models.RefreshToken, error) {
-	idp.mu.Lock()
-	defer idp.mu.Unlock()
-
-	rt, exists := idp.refreshTokens[token]
-	if !exists {
-		return nil, errors.New("invalid refresh token")
-	}
-
-	if rt.ExpiresAt.Before(time.Now()) {
-		delete(idp.refreshTokens, token)
-		return nil, errors.New("refresh token expired")
-	}
-
-	if rt.ClientID != clientID {
-		return nil, errors.New("client ID mismatch")
-	}
-
-	// Implement refresh token rotation - delete old token. Return a copy so
-	// binding fields remain available to the caller after removal.
-	copy := *rt
-	delete(idp.refreshTokens, token)
-
-	return &copy, nil
 }
 
 // RevokeRefreshToken revokes a refresh token

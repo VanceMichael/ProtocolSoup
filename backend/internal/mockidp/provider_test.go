@@ -133,7 +133,7 @@ func TestAuthorizationCodeLifetimeIsAtMostSixtySeconds(t *testing.T) {
 	}
 }
 
-func TestValidateAuthorizationCodeRejectsExpiredCode(t *testing.T) {
+func TestBeginAuthorizationCodeRedemptionRejectsExpiredCode(t *testing.T) {
 	keySet, err := crypto.NewKeySet()
 	if err != nil {
 		t.Fatal(err)
@@ -157,9 +157,9 @@ func TestValidateAuthorizationCodeRejectsExpiredCode(t *testing.T) {
 	// FAPI2 waits 62s; simulate expiry without sleeping.
 	authCode.ExpiresAt = time.Now().Add(-time.Second)
 
-	_, err = idp.ValidateAuthorizationCode(authCode.Code, clientID, redirectURI, "")
+	_, _, err = idp.BeginAuthorizationCodeRedemption(authCode.Code, clientID, redirectURI, "")
 	if err == nil || err.Error() != "authorization code expired" {
-		t.Fatalf("ValidateAuthorizationCode = %v, want authorization code expired", err)
+		t.Fatalf("BeginAuthorizationCodeRedemption = %v, want authorization code expired", err)
 	}
 }
 

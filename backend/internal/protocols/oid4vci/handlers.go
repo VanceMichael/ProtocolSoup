@@ -21,6 +21,7 @@ import (
 	"github.com/ParleSec/ProtocolSoup/internal/crypto"
 	"github.com/ParleSec/ProtocolSoup/internal/dpop"
 	"github.com/ParleSec/ProtocolSoup/internal/lookingglass"
+	"github.com/ParleSec/ProtocolSoup/internal/mockidp"
 	"github.com/ParleSec/ProtocolSoup/internal/vc"
 	"github.com/ParleSec/ProtocolSoup/pkg/models"
 	"github.com/go-chi/chi/v5"
@@ -489,8 +490,8 @@ func buildCredentialOfferDeliveryURL(endpoint string, offer models.VCCredentialO
 // part of OpenID4VCI 1.0 Section 4.1.1.
 func marshalCredentialOfferForWire(offer models.VCCredentialOffer) ([]byte, error) {
 	wire := struct {
-		CredentialIssuer           string                        `json:"credential_issuer"`
-		CredentialConfigurationIDs []string                      `json:"credential_configuration_ids"`
+		CredentialIssuer           string                         `json:"credential_issuer"`
+		CredentialConfigurationIDs []string                       `json:"credential_configuration_ids"`
 		Grants                     models.VCCredentialOfferGrants `json:"grants,omitempty"`
 	}{
 		CredentialIssuer:           offer.CredentialIssuer,
@@ -1141,12 +1142,31 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 		}
 	}
 
-	authCode, err := p.mockIDP.ValidateAuthorizationCode(code, clientID, redirectURI, codeVerifier)
+	// Claim the code exclusively and validate every binding without consuming
+	// it. Commit (below) finalizes consumption only once the access token,
+	// refresh token, access/refresh grant context and issuer transaction state
+	// are all prepared; a transient failure aborts and restores the code.
+	authCode, redemption, err := p.mockIDP.BeginAuthorizationCodeRedemption(code, clientID, redirectURI, codeVerifier)
 	if err != nil {
 		writeOID4VCIError(w, http.StatusBadRequest, "invalid_grant", err.Error())
 		return
 	}
+	finalized := false
+	var partial mockidp.PartialTokens
+	defer func() {
+		if !finalized {
+			redemption.Abort(partial)
+		}
+	}()
+	// Deterministic security rejections after the claim burn the code: a
+	// rejected presentation must not leave the code available for reuse.
+	rejectGrant := func() {
+		redemption.Reject()
+		finalized = true
+	}
+
 	if authCode.DPoPJKT != "" && dpopJKT != authCode.DPoPJKT {
+		rejectGrant()
 		writeOID4VCIError(w, http.StatusBadRequest, "invalid_grant", "authorization code is bound to a different DPoP key")
 		return
 	}
@@ -1161,6 +1181,7 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 	authorizedCredentialConfigurations := make(map[string]struct{}, len(authorizedCredentialConfigurationIDs))
 	for _, credentialConfigurationID := range authorizedCredentialConfigurationIDs {
 		if _, supported := p.credentialConfigurations[credentialConfigurationID]; !supported {
+			rejectGrant()
 			writeOID4VCIError(w, http.StatusBadRequest, "invalid_grant", "authorization code contains an unsupported credential_configuration_id")
 			return
 		}
@@ -1168,6 +1189,7 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 	}
 	if tokenAuthorizationDetailsUsed {
 		if err := validateCredentialConfigurationSubset(tokenRequestedCredentialIDs, authorizedCredentialConfigurations); err != nil {
+			rejectGrant()
 			writeOID4VCIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
@@ -1187,6 +1209,12 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 	if dpopJKT != "" {
 		accessTokenClaims = dpop.WithCnfJKT(accessTokenClaims, dpopJKT)
 	}
+
+	// Signer failure before any artifact exists: the code stays redeemable.
+	if err := p.mockIDP.Fault(mockidp.GrantAuthorizationCode, mockidp.GrantPhaseBeforeMint); err != nil {
+		writeServerError(w, "issue access token", err)
+		return
+	}
 	accessToken, err := p.mockIDP.JWTService().CreateAccessToken(
 		authCode.UserID,
 		"oid4vci",
@@ -1195,6 +1223,11 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 		accessTokenClaims,
 	)
 	if err != nil {
+		writeServerError(w, "issue access token", err)
+		return
+	}
+	partial.AccessTokens = []string{accessToken}
+	if err := p.mockIDP.Fault(mockidp.GrantAuthorizationCode, mockidp.GrantPhaseAfterAccessToken); err != nil {
 		writeServerError(w, "issue access token", err)
 		return
 	}
@@ -1211,6 +1244,7 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 		return
 	}
 	p.mockIDP.StoreRefreshToken(refreshToken, clientID, authCode.UserID, scope, authCode.AuthTime, time.Now().Add(refreshTokenTTL))
+	partial.RefreshTokens = []string{refreshToken}
 	// RFC 9449 ?5: DPoP-bind refresh tokens only for public clients that are
 	// not otherwise sender-constrained. Attestation-authenticated clients are
 	// bound to the Client Instance Key (OAuth2-ATCA ?9.3); FAPI2 refresh
@@ -1223,7 +1257,10 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 		// Client Instance Key, not merely the client_id.
 		p.mockIDP.BindRefreshTokenClientInstanceKey(refreshToken, attestation.InstanceJKT)
 	}
-	p.mockIDP.RecordIssuedTokens(authCode.Code, accessToken, refreshToken)
+	if err := p.mockIDP.Fault(mockidp.GrantAuthorizationCode, mockidp.GrantPhaseAfterRefreshToken); err != nil {
+		writeServerError(w, "issue refresh token", err)
+		return
+	}
 
 	nonce := models.VCNonce{
 		Value:     p.randomValue(24),
@@ -1235,6 +1272,18 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 	if err != nil {
 		writeServerError(w, "create wallet identity", err)
 		return
+	}
+
+	// Capture the prior issuer-transaction status so an abort after ancillary
+	// state is prepared can roll the marker back instead of leaving an
+	// orphaned "token_issued" transaction with no delivered token.
+	priorIssuerStatus := ""
+	if issuerState := strings.TrimSpace(authCode.IssuerState); issuerState != "" {
+		p.mu.RLock()
+		if transaction := p.issuerInitiatedOffers[issuerState]; transaction != nil {
+			priorIssuerStatus = transaction.Status
+		}
+		p.mu.RUnlock()
 	}
 
 	p.mu.Lock()
@@ -1265,7 +1314,36 @@ func (p *Plugin) handleAuthorizationCodeTokenGrant(w http.ResponseWriter, r *htt
 	}
 	p.mu.Unlock()
 
+	// Remove protocol ancillary state when preparation fails after it was
+	// stored, so no access/refresh grant context or token_issued marker
+	// outlives the aborted exchange.
+	cleanupAncillary := func() {
+		p.mu.Lock()
+		delete(p.accessGrants, accessToken)
+		delete(p.refreshGrants, refreshToken)
+		p.mu.Unlock()
+		if priorIssuerStatus != "" {
+			p.updateIssuerInitiatedTransaction(authCode.IssuerState, priorIssuerStatus)
+		}
+	}
+
 	issuerTransaction := p.updateIssuerInitiatedTransaction(authCode.IssuerState, issuerInitiatedStatusTokenIssued)
+	if err := p.mockIDP.Fault(mockidp.GrantAuthorizationCode, mockidp.GrantPhaseAfterAncillary); err != nil {
+		cleanupAncillary()
+		writeServerError(w, "persist token grant state", err)
+		return
+	}
+
+	// Finally consume the code and record the replay association now that the
+	// complete response, mockIdP token state and OID4VCI grant context all
+	// exist (RFC 6749 Section 4.1.2).
+	if err := redemption.Commit(partial); err != nil {
+		cleanupAncillary()
+		writeServerError(w, "finalize token exchange", err)
+		return
+	}
+	finalized = true
+
 	effectiveSessionID := sessionID
 	if effectiveSessionID == "" && issuerTransaction != nil {
 		effectiveSessionID = issuerTransaction.SessionID

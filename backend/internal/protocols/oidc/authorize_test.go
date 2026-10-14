@@ -570,7 +570,7 @@ func TestIssueOIDCTokensCarriesAuthorizationCodeAuthTime(t *testing.T) {
 	authCode.UserID = subject
 	authCode.Scope = "openid"
 	authCode.AuthTime = authTime
-	resp, err := p.issueOIDCTokens(authCode)
+	resp, err := p.issueOIDCTokens(mockidp.GrantAuthorizationCode, authCode)
 	if err != nil {
 		t.Fatalf("issueOIDCTokens: %v", err)
 	}
@@ -592,9 +592,9 @@ func TestStoreRefreshTokenPreservesAuthTime(t *testing.T) {
 	authTime := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
 	token := "refresh-" + time.Now().Format("150405.000000000")
 	p.mockIdP.StoreRefreshToken(token, testConfClient, testUserID, "openid", authTime, time.Now().Add(24*time.Hour))
-	rt, err := p.mockIdP.ValidateRefreshToken(token, testConfClient)
-	if err != nil {
-		t.Fatalf("ValidateRefreshToken: %v", err)
+	rt, ok := p.mockIdP.GetRefreshToken(token)
+	if !ok {
+		t.Fatalf("GetRefreshToken: stored refresh token not found")
 	}
 	if !rt.AuthTime.Equal(authTime) {
 		t.Fatalf("refresh token AuthTime = %v, want %v (must persist for refresh-issued ID tokens)", rt.AuthTime, authTime)

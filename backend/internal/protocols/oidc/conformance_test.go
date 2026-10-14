@@ -574,7 +574,7 @@ func TestCodeFlowIDTokenOmitsScopeAndCustomClaims(t *testing.T) {
 	authCode.Scope = "openid profile email"
 	authCode.AuthTime = time.Now()
 
-	resp, err := p.issueOIDCTokens(authCode)
+	resp, err := p.issueOIDCTokens(mockidp.GrantAuthorizationCode, authCode)
 	if err != nil {
 		t.Fatalf("issueOIDCTokens: %v", err)
 	}

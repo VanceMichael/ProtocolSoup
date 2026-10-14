@@ -960,8 +960,10 @@ func (p *Plugin) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		Reference:   "OpenID Connect Core 1.0 Section 3.1.3",
 	})
 
-	// Validate authorization code
-	authCode, err := p.mockIdP.ValidateAuthorizationCode(code, clientID, redirectURI, codeVerifier)
+	// Claim the code exclusively and validate every binding without consuming
+	// it; Redemption.Commit finalizes consumption only after the complete
+	// response (access token + tracking, refresh token, ID token) is prepared.
+	authCode, redemption, err := p.mockIdP.BeginAuthorizationCodeRedemption(code, clientID, redirectURI, codeVerifier)
 	if err != nil {
 		p.emitEvent(sessionID, lookingglass.EventTypeSecurityWarning, "Code Validation Failed", map[string]interface{}{
 			"error":                 err.Error(),
@@ -974,12 +976,29 @@ func (p *Plugin) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	var partial mockidp.PartialTokens
+	finalized := false
+	defer func() {
+		if !finalized {
+			redemption.Abort(partial)
+		}
+	}()
+
 	// Generate tokens including ID token
-	tokenResponse, err := p.issueOIDCTokens(authCode)
+	tokenResponse, err := p.issueOIDCTokens(mockidp.GrantAuthorizationCode, authCode)
+	partial = oidcPartialTokens(tokenResponse)
 	if err != nil {
 		writeOIDCTokenError(w, http.StatusInternalServerError, "server_error", "Failed to issue tokens", "")
 		return
 	}
+
+	// Finally consume the code and bind the replay record to the exact tokens
+	// minted, now that the full response exists (RFC 6749 Section 4.1.2).
+	if err := redemption.Commit(partial); err != nil {
+		writeOIDCTokenError(w, http.StatusServiceUnavailable, "server_error", "Failed to issue tokens", "")
+		return
+	}
+	finalized = true
 
 	// Emit ID token issued event
 	p.emitEvent(sessionID, lookingglass.EventTypeTokenIssued, "OIDC Tokens Issued", map[string]interface{}{
@@ -1069,8 +1088,11 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		Reference:   "OpenID Connect Core 1.0 Section 12",
 	})
 
-	// Validate refresh token
-	rt, err := p.mockIdP.ValidateRefreshToken(refreshToken, clientID)
+	// Claim the refresh token exclusively without rotating it: the old token
+	// is deleted only at Commit once the rotated response (access token +
+	// tracking, replacement refresh token, optional ID token) is fully
+	// prepared.
+	rt, redemption, err := p.mockIdP.BeginRefreshTokenRedemption(refreshToken, clientID)
 	if err != nil {
 		p.emitEvent(sessionID, lookingglass.EventTypeSecurityWarning, "Refresh Token Invalid", map[string]interface{}{
 			"error":                err.Error(),
@@ -1087,12 +1109,31 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		scope = rt.Scope
 	}
 
+	var partial mockidp.PartialTokens
+	finalized := false
+	defer func() {
+		if !finalized {
+			redemption.Abort(partial)
+		}
+	}()
+
+	fail := func(status int, code, description string) {
+		writeOIDCTokenError(w, status, code, description, "")
+	}
+
 	// Generate new tokens (including new ID token if openid scope)
 	jwtService := p.mockIdP.JWTService()
 	scopes := strings.Split(scope, " ")
 	subject, err := p.outwardSubject(clientID, rt.UserID)
 	if err != nil {
-		writeOIDCTokenError(w, http.StatusInternalServerError, "server_error", "Failed to resolve subject identifier", "")
+		fail(http.StatusInternalServerError, "server_error", "Failed to resolve subject identifier")
+		return
+	}
+
+	// Signer failure before any artifact exists: the old refresh token stays
+	// valid and a legal retry can rotate it.
+	if err := p.mockIdP.Fault(mockidp.GrantRefreshToken, mockidp.GrantPhaseBeforeMint); err != nil {
+		fail(http.StatusInternalServerError, "server_error", "Failed to issue tokens")
 		return
 	}
 
@@ -1107,10 +1148,16 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		nil,
 	)
 	if err != nil {
-		writeOIDCTokenError(w, http.StatusInternalServerError, "server_error", "Failed to create access token", "")
+		fail(http.StatusInternalServerError, "server_error", "Failed to create access token")
 		return
 	}
+	partial.AccessTokens = []string{accessToken}
 	p.mockIdP.TrackAccessToken(subject, accessToken)
+
+	if err := p.mockIdP.Fault(mockidp.GrantRefreshToken, mockidp.GrantPhaseAfterAccessToken); err != nil {
+		fail(http.StatusInternalServerError, "server_error", "Failed to issue tokens")
+		return
+	}
 
 	// Create new refresh token (rotation)
 	newRefreshToken, err := jwtService.CreateRefreshToken(
@@ -1120,13 +1167,19 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		7*24*time.Hour,
 	)
 	if err != nil {
-		writeOIDCTokenError(w, http.StatusInternalServerError, "server_error", "Failed to create refresh token", "")
+		fail(http.StatusInternalServerError, "server_error", "Failed to create refresh token")
 		return
 	}
 
 	// Store new refresh token, preserving the original authentication time so a
 	// rotated chain keeps reporting the same auth_time (OIDC Core 1.0 Section 12.2).
 	p.mockIdP.StoreRefreshToken(newRefreshToken, clientID, rt.UserID, scope, rt.AuthTime, time.Now().Add(7*24*time.Hour))
+	partial.RefreshTokens = []string{newRefreshToken}
+
+	if err := p.mockIdP.Fault(mockidp.GrantRefreshToken, mockidp.GrantPhaseAfterRefreshToken); err != nil {
+		fail(http.StatusInternalServerError, "server_error", "Failed to issue tokens")
+		return
+	}
 
 	response := models.TokenResponse{
 		AccessToken:  accessToken,
@@ -1162,10 +1215,25 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 			nil,
 			&crypto.IDTokenOptions{ACR: acrSingleFactorLogin, AMR: amrSingleFactorLogin},
 		)
-		if err == nil {
-			response.IDToken = idToken
+		if err != nil {
+			fail(http.StatusInternalServerError, "server_error", "Failed to create ID token")
+			return
+		}
+		response.IDToken = idToken
+
+		if err := p.mockIdP.Fault(mockidp.GrantRefreshToken, mockidp.GrantPhaseAfterIDToken); err != nil {
+			fail(http.StatusInternalServerError, "server_error", "Failed to issue tokens")
+			return
 		}
 	}
+
+	// Rotate the old refresh token only now, once the complete response is
+	// prepared; a lost claim revokes the new artifacts instead of succeeding.
+	if err := redemption.Commit(partial); err != nil {
+		fail(http.StatusServiceUnavailable, "server_error", "Failed to issue tokens")
+		return
+	}
+	finalized = true
 
 	// Emit token refresh success
 	p.emitEvent(sessionID, lookingglass.EventTypeTokenIssued, "OIDC Tokens Refreshed", map[string]interface{}{
@@ -1219,8 +1287,29 @@ func (p *Plugin) outwardSubject(clientID, userID string) (string, error) {
 	return p.mockIdP.SubjectForClient(client, userID)
 }
 
-// issueOIDCTokens creates access token, refresh token, and ID token
-func (p *Plugin) issueOIDCTokens(authCode *models.AuthorizationCode) (*models.TokenResponse, error) {
+// oidcPartialTokens collects the tokens an OIDC mint managed to produce so
+// Redemption.Abort can revoke/delete them after a mid-exchange failure.
+func oidcPartialTokens(response *models.TokenResponse) mockidp.PartialTokens {
+	var partial mockidp.PartialTokens
+	if response == nil {
+		return partial
+	}
+	if response.AccessToken != "" {
+		partial.AccessTokens = []string{response.AccessToken}
+	}
+	if response.RefreshToken != "" {
+		partial.RefreshTokens = []string{response.RefreshToken}
+	}
+	return partial
+}
+
+// issueOIDCTokens creates access token, refresh token, and ID token.
+//
+// kind selects the phased fault points that prove the grant is not consumed
+// until all artifacts are prepared. On failure the returned response may
+// carry whatever tokens were already minted; the caller aborts (revoking
+// them) and restores the grant for a legal retry.
+func (p *Plugin) issueOIDCTokens(kind mockidp.GrantKind, authCode *models.AuthorizationCode) (*models.TokenResponse, error) {
 	jwtService := p.mockIdP.JWTService()
 	subject, err := p.outwardSubject(authCode.ClientID, authCode.UserID)
 	if err != nil {
@@ -1229,6 +1318,17 @@ func (p *Plugin) issueOIDCTokens(authCode *models.AuthorizationCode) (*models.To
 
 	// Parse scopes
 	scopes := strings.Split(authCode.Scope, " ")
+
+	response := &models.TokenResponse{
+		TokenType: "Bearer",
+		ExpiresIn: 3600,
+		Scope:     authCode.Scope,
+	}
+
+	// Signer failure before any artifact exists: the code stays redeemable.
+	if err := p.mockIdP.Fault(kind, mockidp.GrantPhaseBeforeMint); err != nil {
+		return response, err
+	}
 
 	// The access token carries the granted scope; the UserInfo endpoint derives
 	// the profile/email/... claims from that scope on demand. The token itself
@@ -1243,9 +1343,15 @@ func (p *Plugin) issueOIDCTokens(authCode *models.AuthorizationCode) (*models.To
 		requestedUserInfoClaimNames(authCode.Claims),
 	)
 	if err != nil {
-		return nil, err
+		return response, err
 	}
+	response.AccessToken = accessToken
 	p.mockIdP.TrackAccessToken(subject, accessToken)
+
+	// Failure after the access token exists: abort must revoke/untrack it.
+	if err := p.mockIdP.Fault(kind, mockidp.GrantPhaseAfterAccessToken); err != nil {
+		return response, err
+	}
 
 	// Create refresh token
 	refreshToken, err := jwtService.CreateRefreshToken(
@@ -1255,23 +1361,19 @@ func (p *Plugin) issueOIDCTokens(authCode *models.AuthorizationCode) (*models.To
 		7*24*time.Hour,
 	)
 	if err != nil {
-		return nil, err
+		return response, err
 	}
+	response.RefreshToken = refreshToken
 
 	// Store refresh token, carrying the authentication time so a refreshed ID
-	// Token keeps the same auth_time (OIDC Core 1.0 Section 12.2).
+	// Token keeps the same auth_time (OIDC Core 1.0 Section 12.2). The code's
+	// replay association is written later by Redemption.Commit, atomically with
+	// consuming the code.
 	p.mockIdP.StoreRefreshToken(refreshToken, authCode.ClientID, authCode.UserID, authCode.Scope, authCode.AuthTime, time.Now().Add(7*24*time.Hour))
 
-	// Bind the issued tokens to the redeemed code so that, if the code is ever
-	// replayed, these exact tokens are revoked (RFC 6749 Section 4.1.2).
-	p.mockIdP.RecordIssuedTokens(authCode.Code, accessToken, refreshToken)
-
-	response := &models.TokenResponse{
-		AccessToken:  accessToken,
-		TokenType:    "Bearer",
-		ExpiresIn:    3600,
-		RefreshToken: refreshToken,
-		Scope:        authCode.Scope,
+	// Failure after the refresh token is stored: abort must delete it too.
+	if err := p.mockIdP.Fault(kind, mockidp.GrantPhaseAfterRefreshToken); err != nil {
+		return response, err
 	}
 
 	// Create ID token if openid scope is present
@@ -1301,9 +1403,15 @@ func (p *Plugin) issueOIDCTokens(authCode *models.AuthorizationCode) (*models.To
 			&crypto.IDTokenOptions{ACR: acrSingleFactorLogin, AMR: amrSingleFactorLogin},
 		)
 		if err != nil {
-			return nil, err
+			return response, err
 		}
 		response.IDToken = idToken
+
+		// Failure after the ID token exists: all three artifacts must be
+		// revoked/deleted and the code restored for a legal retry.
+		if err := p.mockIdP.Fault(kind, mockidp.GrantPhaseAfterIDToken); err != nil {
+			return response, err
+		}
 	}
 
 	return response, nil

@@ -18,8 +18,9 @@ import (
 //
 // The authorization endpoint is the existing mockidp-backed OIDC authorize
 // endpoint (/oidc/authorize): codes it issues are already accepted by
-// handleAuthorizationCodeTokenGrant via the shared MockIdP.ValidateAuthorizationCode,
-// so this handler adds discovery only, not new authorization behavior.
+// handleAuthorizationCodeTokenGrant via the shared
+// MockIdP.BeginAuthorizationCodeRedemption transaction, so this handler adds
+// discovery only, not new authorization behavior.
 func (p *Plugin) handleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
 	if !p.isAllowedASMetadataRequestPath(r.URL.Path) {
 		http.NotFound(w, r)

@@ -608,8 +608,10 @@ func (p *Plugin) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		})
 	}
 
-	// Validate authorization code
-	authCode, err := p.mockIdP.ValidateAuthorizationCode(code, clientID, redirectURI, codeVerifier)
+	// Claim the code exclusively and validate every binding, but do not consume
+	// it yet: consumption is finalized with redemption.Commit only after the
+	// whole token response is prepared.
+	authCode, redemption, err := p.mockIdP.BeginAuthorizationCodeRedemption(code, clientID, redirectURI, codeVerifier)
 	if err != nil {
 		p.emitEvent(sessionID, lookingglass.EventTypeSecurityWarning, "Authorization Code Validation Failed", map[string]interface{}{
 			"error":                 err.Error(),
@@ -642,7 +644,20 @@ func (p *Plugin) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 	// clients per RFC 9449 Section 5 -- a confidential client's refresh
 	// token is already sender-constrained via its authentication
 	// credentials, so it is not additionally bound to the proof key.
-	tokenResponse, err := p.issueTokens(authCode.UserID, clientID, authCode.Scope, dpopJKT, client.Public)
+	//
+	// The code remains redeemable until Commit: a signer/state-save failure
+	// aborts the exchange (revoking any partial token) and the client's legal
+	// retry gets a fresh attempt instead of a bare invalid_grant.
+	var partial mockidp.PartialTokens
+	finalized := false
+	defer func() {
+		if !finalized {
+			redemption.Abort(partial)
+		}
+	}()
+
+	tokenResponse, err := p.issueTokens(mockidp.GrantAuthorizationCode, authCode.UserID, clientID, authCode.Scope, dpopJKT, client.Public)
+	partial = grantPartialTokens(tokenResponse)
 	if err != nil {
 		p.emitEvent(sessionID, lookingglass.EventTypeSecurityWarning, "Token Generation Failed", map[string]interface{}{
 			"error": err.Error(),
@@ -650,9 +665,18 @@ func (p *Plugin) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		writeOAuth2Error(w, "server_error", "Failed to issue tokens", "")
 		return
 	}
-	// RFC 6749 Section 4.1.2: record tokens against the redeemed code so a
-	// later replay can revoke them (SHOULD). Matches the OIDC / OID4VCI paths.
-	p.mockIdP.RecordIssuedTokens(authCode.Code, tokenResponse.AccessToken, tokenResponse.RefreshToken)
+
+	// Finally consume the code and record the replay association now that the
+	// complete response, access-token tracking and refresh token all exist
+	// (RFC 6749 Section 4.1.2).
+	if err := redemption.Commit(partial); err != nil {
+		p.emitEvent(sessionID, lookingglass.EventTypeSecurityWarning, "Token Generation Failed", map[string]interface{}{
+			"error": err.Error(),
+		})
+		writeOAuth2ErrorStatus(w, http.StatusServiceUnavailable, "server_error", "Failed to issue tokens", "")
+		return
+	}
+	finalized = true
 
 	// Emit token issued event
 	p.emitEvent(sessionID, lookingglass.EventTypeTokenIssued, "Access Token Issued", map[string]interface{}{
@@ -749,8 +773,10 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// Validate refresh token
-	rt, err := p.mockIdP.ValidateRefreshToken(refreshToken, clientID)
+	// Claim the refresh token exclusively and validate it without rotating it:
+	// the old token is deleted only at Commit, once the rotated response is
+	// fully prepared.
+	rt, redemption, err := p.mockIdP.BeginRefreshTokenRedemption(refreshToken, clientID)
 	if err != nil {
 		p.emitEvent(sessionID, lookingglass.EventTypeSecurityWarning, "Refresh Token Invalid", map[string]interface{}{
 			"error":                err.Error(),
@@ -760,6 +786,13 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		writeOAuth2Error(w, "invalid_grant", err.Error(), "")
 		return
 	}
+	finalized := false
+	var partial mockidp.PartialTokens
+	defer func() {
+		if !finalized {
+			redemption.Abort(partial)
+		}
+	}()
 
 	// Use original scope if not specified
 	if scope == "" {
@@ -773,6 +806,10 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 	// like any other invalid_grant, not silently downgraded to bearer.
 	boundJKT := rt.JKT
 	if boundJKT != "" && dpopJKT != boundJKT {
+		// Deterministic security rejection: consume the presented token just
+		// as the previous eager rotation did, without issuing a replacement.
+		redemption.Reject()
+		finalized = true
 		p.emitEvent(sessionID, lookingglass.EventTypeSecurityWarning, "DPoP Key Mismatch On Refresh", map[string]interface{}{
 			"error":  "invalid_grant",
 			"reason": "dpop_proof_key_mismatch",
@@ -792,11 +829,20 @@ func (p *Plugin) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 	// public-client restriction applied there -- only happens for a
 	// public client; client.Public is re-checked here too so the
 	// invariant holds even if that upstream guarantee ever changes.
-	tokenResponse, err := p.issueTokens(rt.UserID, clientID, scope, boundJKT, client.Public)
+	tokenResponse, err := p.issueTokens(mockidp.GrantRefreshToken, rt.UserID, clientID, scope, boundJKT, client.Public)
+	partial = grantPartialTokens(tokenResponse)
 	if err != nil {
 		writeOAuth2Error(w, "server_error", "Failed to issue tokens", "")
 		return
 	}
+
+	// Rotate only now: delete the old token atomically with the prepared
+	// response; on a lost claim the partial new tokens are revoked instead.
+	if err := redemption.Commit(partial); err != nil {
+		writeOAuth2ErrorStatus(w, http.StatusServiceUnavailable, "server_error", "Failed to issue tokens", "")
+		return
+	}
+	finalized = true
 
 	// Emit token rotation event
 	p.emitEvent(sessionID, lookingglass.EventTypeTokenIssued, "Tokens Refreshed", map[string]interface{}{
@@ -1684,7 +1730,13 @@ func (p *Plugin) redirectAuthorizationFragment(w http.ResponseWriter, r *http.Re
 // would remove that mechanism's documented benefit (client credential
 // rotation without invalidating the refresh token) for no security gain,
 // since the token is already sender-constrained.
-func (p *Plugin) issueTokens(userID, clientID, scope, dpopJKT string, bindRefreshToken bool) (*models.TokenResponse, error) {
+//
+// kind identifies the one-time grant being exchanged and selects the phased
+// fault points used to prove atomic grant recovery. On error the returned
+// TokenResponse may be partially populated (access token tracked, refresh
+// token stored); the caller passes those fields to Redemption.Abort so no
+// orphaned artifact survives.
+func (p *Plugin) issueTokens(kind mockidp.GrantKind, userID, clientID, scope, dpopJKT string, bindRefreshToken bool) (*models.TokenResponse, error) {
 	jwtService := p.mockIdP.JWTService()
 
 	// Get user claims
@@ -1692,6 +1744,14 @@ func (p *Plugin) issueTokens(userID, clientID, scope, dpopJKT string, bindRefres
 	userClaims := p.mockIdP.UserClaims(userID, scopes)
 	if dpopJKT != "" {
 		userClaims = dpop.WithCnfJKT(userClaims, dpopJKT)
+	}
+
+	partial := &models.TokenResponse{TokenType: dpop.TokenType(dpopJKT), ExpiresIn: 3600, Scope: scope}
+
+	// Signer failure before any artifact exists: the grant stays untouched and
+	// a legal retry can redeem it.
+	if err := p.mockIdP.Fault(kind, mockidp.GrantPhaseBeforeMint); err != nil {
+		return partial, err
 	}
 
 	// Create access token
@@ -1703,9 +1763,16 @@ func (p *Plugin) issueTokens(userID, clientID, scope, dpopJKT string, bindRefres
 		userClaims,
 	)
 	if err != nil {
-		return nil, err
+		return partial, err
 	}
+	partial.AccessToken = accessToken
 	p.mockIdP.TrackAccessToken(userID, accessToken)
+
+	// Failure after the access token exists (for example the refresh-token
+	// signer or a state-save failure): abort must revoke/untrack it.
+	if err := p.mockIdP.Fault(kind, mockidp.GrantPhaseAfterAccessToken); err != nil {
+		return partial, err
+	}
 
 	// Create refresh token
 	refreshToken, err := jwtService.CreateRefreshToken(
@@ -1715,8 +1782,9 @@ func (p *Plugin) issueTokens(userID, clientID, scope, dpopJKT string, bindRefres
 		7*24*time.Hour,
 	)
 	if err != nil {
-		return nil, err
+		return partial, err
 	}
+	partial.RefreshToken = refreshToken
 
 	// Store refresh token
 	p.mockIdP.StoreRefreshToken(refreshToken, clientID, userID, scope, time.Now(), time.Now().Add(7*24*time.Hour))
@@ -1724,15 +1792,28 @@ func (p *Plugin) issueTokens(userID, clientID, scope, dpopJKT string, bindRefres
 		p.mockIdP.BindRefreshTokenKey(refreshToken, dpopJKT)
 	}
 
-	response := &models.TokenResponse{
-		AccessToken:  accessToken,
-		TokenType:    dpop.TokenType(dpopJKT),
-		ExpiresIn:    3600,
-		RefreshToken: refreshToken,
-		Scope:        scope,
+	// Failure after the refresh token is stored: abort must delete it too.
+	if err := p.mockIdP.Fault(kind, mockidp.GrantPhaseAfterRefreshToken); err != nil {
+		return partial, err
 	}
 
-	return response, nil
+	return partial, nil
+}
+
+// grantPartialTokens collects whatever tokens mintGrantTokens managed to
+// produce so Redemption.Abort can revoke/delete them.
+func grantPartialTokens(response *models.TokenResponse) mockidp.PartialTokens {
+	var partial mockidp.PartialTokens
+	if response == nil {
+		return partial
+	}
+	if response.AccessToken != "" {
+		partial.AccessTokens = []string{response.AccessToken}
+	}
+	if response.RefreshToken != "" {
+		partial.RefreshTokens = []string{response.RefreshToken}
+	}
+	return partial
 }
 
 // Helper functions

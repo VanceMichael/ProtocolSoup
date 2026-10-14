@@ -208,11 +208,13 @@ func (idp *MockIdP) DenyDeviceAuthorization(userCode string, now time.Time) erro
 	return nil
 }
 
-// PollDeviceAuthorization evaluates a token-endpoint poll (RFC 8628 Section 3.5).
-// A successful authorized poll consumes the device_code so it cannot be reused.
-func (idp *MockIdP) PollDeviceAuthorization(deviceCode, clientID string, now time.Time) (DevicePollOutcome, *DeviceAuthorization) {
-	idp.mu.Lock()
-	defer idp.mu.Unlock()
+// evaluateDevicePollLocked evaluates a token-endpoint poll (RFC 8628 Section
+// 3.5) without consuming an authorized device_code. The DevicePollAuthorized
+// outcome returns a defensive copy and leaves Status untouched; the caller
+// (BeginDeviceCodeRedemption) claims the grant and consumes it only when the
+// complete token response has been prepared. Pending/slow-down bookkeeping is
+// applied here. The caller must hold idp.mu.
+func (idp *MockIdP) evaluateDevicePollLocked(deviceCode, clientID string, now time.Time) (DevicePollOutcome, *DeviceAuthorization) {
 	auth, exists := idp.deviceAuthByCode[deviceCode]
 	if !exists || auth == nil {
 		return DevicePollUnknown, nil
@@ -229,7 +231,6 @@ func (idp *MockIdP) PollDeviceAuthorization(deviceCode, clientID string, now tim
 	case DeviceAuthConsumed:
 		return DevicePollConsumed, auth
 	case DeviceAuthAuthorized:
-		auth.Status = DeviceAuthConsumed
 		copy := *auth
 		return DevicePollAuthorized, &copy
 	case DeviceAuthPending:

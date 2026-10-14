@@ -235,7 +235,7 @@ func (p *Plugin) handleDeviceCodeGrant(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 
-	outcome, auth := p.mockIdP.PollDeviceAuthorization(deviceCode, client.ID, p.now())
+	outcome, auth, redemption := p.mockIdP.BeginDeviceCodeRedemption(deviceCode, client.ID, p.now())
 	switch outcome {
 	case mockidp.DevicePollPending:
 		p.emitEvent(sessionID, lookingglass.EventTypeFlowStep, "Device Authorization Pending", map[string]interface{}{
@@ -277,18 +277,36 @@ func (p *Plugin) handleDeviceCodeGrant(w http.ResponseWriter, r *http.Request, s
 		writeOAuth2Error(w, "invalid_grant", "The provided device_code is invalid", "")
 		return
 	case mockidp.DevicePollAuthorized:
-		// continue
+		// redemption is held exclusively; the authorization is only consumed at
+		// Commit after the token response is fully prepared.
 	default:
 		writeOAuth2Error(w, "invalid_grant", "The provided device_code is invalid", "")
 		return
 	}
 
 	bindRefresh := client.Public
-	tokenResponse, err := p.issueTokens(auth.UserID, client.ID, auth.Scope, dpopJKT, bindRefresh)
+	var partial mockidp.PartialTokens
+	finalized := false
+	defer func() {
+		if !finalized {
+			redemption.Abort(partial)
+		}
+	}()
+
+	tokenResponse, err := p.issueTokens(mockidp.GrantDeviceCode, auth.UserID, client.ID, auth.Scope, dpopJKT, bindRefresh)
+	partial = grantPartialTokens(tokenResponse)
 	if err != nil {
 		writeOAuth2ErrorStatus(w, http.StatusInternalServerError, "server_error", "Failed to issue tokens", "")
 		return
 	}
+
+	// Consume the device_code only now; a failure before this point leaves the
+	// authorization authorized so the device's legal retry can poll again.
+	if err := redemption.Commit(partial); err != nil {
+		writeOAuth2ErrorStatus(w, http.StatusServiceUnavailable, "server_error", "Failed to issue tokens", "")
+		return
+	}
+	finalized = true
 
 	p.emitEvent(sessionID, lookingglass.EventTypeTokenIssued, "Device Access Token Issued", map[string]interface{}{
 		"client_id":     client.ID,
