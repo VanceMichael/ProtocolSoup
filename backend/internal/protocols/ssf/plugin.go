@@ -130,6 +130,9 @@ func (p *Plugin) Initialize(ctx context.Context, config plugin.PluginConfig) err
 
 	// Initialize standalone receiver service on separate port
 	p.receiverService = NewReceiverService(p.receiverPort, p.baseURL, p.receiverToken, p.actionExecutor)
+	// Persist SET processing ownership/step progress/outcome in the SSF SQLite
+	// lifecycle so concurrent deliveries execute once and retries resume.
+	p.receiverService.SetStorage(p.storage)
 	p.receiverService.SetGlass(glass)
 	p.receiverService.SetFederationCAEP(federationServiceURL(), os.Getenv("SSF_TO_FEDERATION_TOKEN"))
 

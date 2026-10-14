@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 // ReceiverService is a standalone SSF receiver that runs on a separate port
@@ -29,7 +31,17 @@ type ReceiverService struct {
 	// JWKS cache
 	jwksCache *JWKSCache
 
-	// JTI replay detection per RFC 8935 §2 step 4 / RFC 8417 §2.2
+	// Durable SET processing ownership/progress/outcome (RFC 8417 §2.2).
+	// When set, jti replay protection and side-effect resume live in SQLite and
+	// survive ClearLogs and ReceiverService rebuilds. ownerID identifies this
+	// instance so a 'processing' row left by a rebuilt service is resumable while
+	// a genuinely concurrent delivery to this instance is rejected as busy.
+	storage    *Storage
+	ownerID    string
+	inflight   map[string]int
+	inflightMu sync.Mutex
+
+	// In-memory JTI replay fallback used only when no Storage is attached.
 	seenJTIs   map[string]time.Time
 	seenJTIsMu sync.RWMutex
 
@@ -251,12 +263,47 @@ func NewReceiverService(port int, transmitterURL, bearerToken string, executor A
 		transmitterURL:  transmitterURL,
 		bearerToken:     bearerToken,
 		jwksCache:       NewJWKSCache(jwksURL, 5*time.Minute),
+		ownerID:         "receiver-" + uuid.NewString(),
+		inflight:        make(map[string]int),
 		seenJTIs:        make(map[string]time.Time),
 		receivedEvents:  make([]ReceivedEvent, 0),
 		responseActions: make([]ResponseAction, 0),
 		actionExecutor:  executor,
 		federationHTTP:  &http.Client{Timeout: 5 * time.Second},
 	}
+}
+
+// SetStorage attaches the shared SSF SQLite lifecycle. Once attached, SET
+// processing ownership, per-step progress and the succeeded/failed outcome are
+// persisted there: concurrent deliveries get one executor, partial failures
+// resume at the unfinished step, and replay protection survives ClearLogs and
+// ReceiverService rebuilds. Must be called before Start.
+func (rs *ReceiverService) SetStorage(storage *Storage) {
+	rs.storage = storage
+}
+
+// inflight is a counter (not a set) so that a concurrent caller that loses the
+// claim as busy can release its own marker without clearing the real executor's.
+func (rs *ReceiverService) markInflight(jti string) {
+	rs.inflightMu.Lock()
+	rs.inflight[jti]++
+	rs.inflightMu.Unlock()
+}
+
+func (rs *ReceiverService) clearInflight(jti string) {
+	rs.inflightMu.Lock()
+	if rs.inflight[jti] > 1 {
+		rs.inflight[jti]--
+	} else {
+		delete(rs.inflight, jti)
+	}
+	rs.inflightMu.Unlock()
+}
+
+func (rs *ReceiverService) isInflight(jti string) bool {
+	rs.inflightMu.Lock()
+	defer rs.inflightMu.Unlock()
+	return rs.inflight[jti] > 0
 }
 
 // SetGlass attaches the Looking Glass bus used for stream-lab visibility.
@@ -387,30 +434,35 @@ func (rs *ReceiverService) handlePush(w http.ResponseWriter, r *http.Request) {
 		if errCode == "" {
 			errCode = "invalid_request"
 		}
-		writeReceiverSSFError(w, http.StatusBadRequest, errCode, status.Description)
+		// Validation failures answer 400; retryable action/federation/storage
+		// failures answer their mapped status so the transmitter redelivers
+		// instead of treating the SET as accepted.
+		httpStatus := http.StatusBadRequest
+		if status.HTTPStatus != 0 {
+			httpStatus = status.HTTPStatus
+		}
+		writeReceiverSSFError(w, httpStatus, errCode, status.Description)
 		return
 	}
 
-	// RFC 8935 §2.2: 202 Accepted on success
+	// RFC 8935 §2.2: 202 Accepted only after every side effect completed durably
 	w.WriteHeader(http.StatusAccepted)
 }
 
 // ProcessPollResponse handles events retrieved via poll delivery (RFC 8936).
 // sessionIDs maps JTI -> session ID (from the stored event metadata, not from the SET).
+// A failed status means the SET was NOT confirmed and stays unacknowledged at the
+// transmitter, so a later poll redelivers it; success/failure per jti is durable.
 func (rs *ReceiverService) ProcessPollResponse(ctx context.Context, sets map[string]string, sessionIDs map[string]string) []SetStatus {
-	var statuses []SetStatus
-	for _, setToken := range sets {
-		// For poll, we pass the token directly; session ID comes from stored metadata
-		jti := ""
-		for k, v := range sets {
-			if v == setToken {
-				jti = k
-				break
-			}
-		}
-		sessionID := sessionIDs[jti]
-		status := rs.processSET(ctx, setToken, sessionID)
-		statuses = append(statuses, status)
+	jtis := make([]string, 0, len(sets))
+	for jti := range sets {
+		jtis = append(jtis, jti)
+	}
+	sort.Strings(jtis)
+
+	statuses := make([]SetStatus, 0, len(jtis))
+	for _, jti := range jtis {
+		statuses = append(statuses, rs.processSET(ctx, sets[jti], sessionIDs[jti]))
 	}
 	return statuses
 }
@@ -570,14 +622,50 @@ func (rs *ReceiverService) processSET(ctx context.Context, setToken, sessionID s
 		},
 	})
 
-	// RFC 8935 §2 step 4 / RFC 8417 §2.2: Reject replayed SETs by tracking seen JTIs
+	// ── Claim exclusive processing ownership (RFC 8935 §2 step 4 / RFC 8417 §2.2) ──
+	// Signature and claims have already passed. From here on jti dedup, per-step
+	// progress and the final outcome are durable, so concurrent push/poll get one
+	// executor and a redelivery can never repeat a succeeded side effect.
+	completedSteps := make(map[string]struct{})
+	usingStorage := rs.storage != nil
 	if jti != "" {
-		rs.seenJTIsMu.RLock()
-		_, seen := rs.seenJTIs[jti]
-		rs.seenJTIsMu.RUnlock()
-		if seen {
-			log.Printf("[SSF Receiver] Duplicate SET rejected (jti %s already processed)", jti)
-			return failedSET("invalid_request", fmt.Sprintf("duplicate SET rejected (jti %s already processed)", jti))
+		if usingStorage {
+			// Mark local in-flight BEFORE claiming so the claim decision is atomic
+			// against concurrent deliveries on this instance (the DB row commit and
+			// the in-memory marker would otherwise leave an undecidable gap).
+			rs.markInflight(jti)
+			outcome, done, err := rs.storage.ClaimSETProcessing(ctx, jti, decoded.Issuer, rs.ownerID, rs.isInflight(jti))
+			if err != nil {
+				rs.clearInflight(jti)
+				log.Printf("[SSF Receiver] Failed to claim SET processing for %s: %v", jti, err)
+				// No side effects may run without an exclusive claim; the failure is
+				// deterministic: a redelivery starts the plan from scratch.
+				return retryableFailedSET(SETErrStorageUnavailable,
+					fmt.Sprintf("failed to claim SET processing: %v", err), http.StatusServiceUnavailable)
+			}
+			switch outcome {
+			case SETClaimDuplicate:
+				rs.clearInflight(jti)
+				log.Printf("[SSF Receiver] Duplicate SET rejected (jti %s already processed)", jti)
+				return failedSET("invalid_request", fmt.Sprintf("duplicate SET rejected (jti %s already processed)", jti))
+			case SETClaimBusy:
+				rs.clearInflight(jti)
+				log.Printf("[SSF Receiver] SET %s is already being processed by this receiver", jti)
+				return retryableFailedSET(SETErrProcessingInProgress,
+					fmt.Sprintf("SET %s is already being processed", jti), http.StatusConflict)
+			}
+			for _, step := range done {
+				completedSteps[step] = struct{}{}
+			}
+			defer rs.clearInflight(jti)
+		} else {
+			rs.seenJTIsMu.RLock()
+			_, seen := rs.seenJTIs[jti]
+			rs.seenJTIsMu.RUnlock()
+			if seen {
+				log.Printf("[SSF Receiver] Duplicate SET rejected (jti %s already processed)", jti)
+				return failedSET("invalid_request", fmt.Sprintf("duplicate SET rejected (jti %s already processed)", jti))
+			}
 		}
 	}
 
@@ -590,18 +678,6 @@ func (rs *ReceiverService) processSET(ctx context.Context, setToken, sessionID s
 		Data: map[string]interface{}{
 			"event_count": len(decoded.Events),
 		},
-	})
-
-	// Record the received event
-	processedAt := time.Now()
-	rs.addReceivedEvent(ReceivedEvent{
-		ID:             jti,
-		ReceivedAt:     receivedAt,
-		DeliveryMethod: "push",
-		SET:            decoded,
-		Verified:       true,
-		Processed:      true,
-		ProcessedAt:    &processedAt,
 	})
 
 	// Extract subject email from the decoded SET
@@ -620,20 +696,109 @@ func (rs *ReceiverService) processSET(ctx context.Context, setToken, sessionID s
 		rs.actionExecutor.InitSessionUserStates(sessionID)
 	}
 
-	// Process events and execute response actions
-	for _, event := range decoded.Events {
+	// Build the full step plan, then execute only steps not already completed by a
+	// previous attempt. A step is durably marked immediately after it succeeds, so
+	// a mid-plan failure resumes at exactly the first unfinished step on retry.
+	type eventPlan struct {
+		index int
+		event DecodedEvent
+		steps []mutationStep
+	}
+	plans := make([]eventPlan, 0, len(decoded.Events))
+	for idx, event := range decoded.Events {
 		log.Printf("[SSF Receiver] Processing event: %s for subject: %s (session: %s)", event.Type, subjectEmail, sessionID)
-		rs.executeResponseActions(ctx, jti, event, subjectEmail, sessionID, decoded.Subject)
-		if event.Type == EventTypeSessionRevoked && subjectEmail != "" {
-			rs.revokeFederationSubject(ctx, sessionID, subjectEmail)
+		steps := planMutationSteps(rs.actionExecutor, idx, event, subjectEmail, sessionID, decoded.Subject)
+		if event.Type == EventTypeSessionRevoked && subjectEmail != "" && rs.federationURL != "" {
+			steps = append(steps, mutationStep{
+				Key:     fmt.Sprintf("e%d:federation-revoke", idx),
+				Label:   "Federation revoke-subject",
+				ErrCode: SETErrFederationRevokeFailed,
+				run: func(ctx context.Context) error {
+					return rs.revokeFederationSubject(ctx, sessionID, subjectEmail)
+				},
+			})
+		}
+		plans = append(plans, eventPlan{index: idx, event: event, steps: steps})
+	}
+
+	var failedStep mutationStep
+	var stepErr error
+planLoop:
+	for _, plan := range plans {
+		for _, step := range plan.steps {
+			if _, done := completedSteps[step.Key]; done {
+				log.Printf("[SSF Receiver] Skipping already-completed step %s (jti %s)", step.Key, jti)
+				continue
+			}
+			if err := step.run(ctx); err != nil {
+				failedStep, stepErr = step, err
+				break planLoop
+			}
+			if jti != "" && usingStorage {
+				if err := rs.storage.CompleteSETProcessingStep(ctx, jti, step.Key); err != nil {
+					// The side effect happened but is not durably recorded. Treat it
+					// as a retryable failure; ownership is released so the next
+					// delivery (same instance included) re-claims and resumes.
+					log.Printf("[SSF Receiver] Failed to persist step %s for %s: %v", step.Key, jti, err)
+					failedStep = mutationStep{Key: step.Key, Label: step.Label, ErrCode: SETErrStorageUnavailable}
+					stepErr = err
+					break planLoop
+				}
+			}
+			completedSteps[step.Key] = struct{}{}
 		}
 	}
 
-	// Record JTI as seen for replay detection
+	if stepErr != nil {
+		description := fmt.Sprintf("SET processing failed at step %q: %v", failedStep.Key, stepErr)
+		log.Printf("[SSF Receiver] %s", description)
+		errCode := failedStep.ErrCode
+		if errCode == "" {
+			errCode = SETErrActionExecutionFailed
+		}
+		if jti != "" && usingStorage {
+			if err := rs.storage.FailSETProcessing(ctx, jti, errCode, description); err != nil {
+				log.Printf("[SSF Receiver] Failed to persist failure state for %s: %v", jti, err)
+			}
+		}
+		// Not "processed": push answers a retryable error (no 202) and poll leaves
+		// the SET unacknowledged so it is redelivered; completed steps are retained.
+		return retryableFailedSET(errCode, description, http.StatusServiceUnavailable)
+	}
+
+	// All side effects completed. Display rows are written only on the success
+	// path (steps completed earlier on a failed attempt are represented too, since
+	// their effects are part of the finished SET).
+	for _, plan := range plans {
+		rs.recordResponseActions(jti, plan.event, subjectEmail, sessionID, len(plan.steps) > 0)
+	}
+
+	// Record the received event as processed only after durable completion
+	processedAt := time.Now()
+	rs.addReceivedEvent(ReceivedEvent{
+		ID:             jti,
+		ReceivedAt:     receivedAt,
+		DeliveryMethod: "push",
+		SET:            decoded,
+		Verified:       true,
+		Processed:      true,
+		ProcessedAt:    &processedAt,
+	})
+
+	// Lock the jti against replay. Durable when Storage is attached; otherwise the
+	// in-memory fallback covers the lifetime of this receiver instance.
 	if jti != "" {
-		rs.seenJTIsMu.Lock()
-		rs.seenJTIs[jti] = time.Now()
-		rs.seenJTIsMu.Unlock()
+		if usingStorage {
+			if err := rs.storage.CompleteSETProcessing(ctx, jti); err != nil {
+				log.Printf("[SSF Receiver] Failed to persist completion for %s: %v", jti, err)
+				return retryableFailedSET(SETErrStorageUnavailable,
+					fmt.Sprintf("failed to persist SET completion: %v", err), http.StatusServiceUnavailable)
+			}
+		} else {
+			rs.seenJTIsMu.Lock()
+			rs.seenJTIs[jti] = time.Now()
+			rs.seenJTIsMu.Unlock()
+		}
 	}
 
 	// Broadcast: Event Processed
@@ -652,14 +817,16 @@ func (rs *ReceiverService) processSET(ctx context.Context, setToken, sessionID s
 	return SetStatus{Status: "success", Description: "Event processed and actions executed"}
 }
 
-// executeResponseActions delegates to the shared EventProcessor
-func (rs *ReceiverService) executeResponseActions(_ context.Context, eventID string, event DecodedEvent, subjectEmail, sessionID string, subject *SETSubject) {
+// recordResponseActions appends and broadcasts the display rows of one event.
+// It carries no side effects — mutation execution and progress tracking happen
+// in processSET before this is called.
+func (rs *ReceiverService) recordResponseActions(eventID string, event DecodedEvent, subjectEmail, sessionID string, mutated bool) {
 	var before *UserSecurityState
 	if rs.actionExecutor != nil && subjectEmail != "" {
 		before, _ = rs.actionExecutor.GetUserStateForSession(sessionID, subjectEmail)
 	}
 
-	actions := ExecuteResponseActions(rs.actionExecutor, eventID, event, subjectEmail, sessionID, subject)
+	actions := buildResponseActions(eventID, event, sessionID, mutated, nil)
 	for _, action := range actions {
 		rs.addResponseAction(action)
 		log.Printf("[SSF Receiver] Action recorded: %s - %s (session: %s)", action.Action, action.Status, sessionID)
@@ -691,7 +858,11 @@ func (rs *ReceiverService) executeResponseActions(_ context.Context, eventID str
 	}
 }
 
-func (rs *ReceiverService) revokeFederationSubject(ctx context.Context, sessionID, email string) {
+// revokeFederationSubject performs the cross-service CAEP revoke-subject hop and
+// returns an error on request-build, transport or non-2xx failure so the caller
+// can keep the SET in its retryable failure state instead of marking it processed.
+// The Looking Glass exchange is broadcast on every attempt, failures included.
+func (rs *ReceiverService) revokeFederationSubject(ctx context.Context, sessionID, email string) error {
 	target := rs.federationURL + "/oauth2/demo/caep/revoke-subject"
 	payload, _ := json.Marshal(map[string]string{"email": email})
 
@@ -722,7 +893,7 @@ func (rs *ReceiverService) revokeFederationSubject(ctx context.Context, sessionI
 	if err != nil {
 		exchange.Response.Body = fmt.Sprintf("error: %v", err)
 		rs.broadcastFederationHop(sessionID, exchange)
-		return
+		return fmt.Errorf("build federation revoke request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -740,7 +911,7 @@ func (rs *ReceiverService) revokeFederationSubject(ctx context.Context, sessionI
 	if err != nil {
 		exchange.Response.Body = fmt.Sprintf("error: %v", err)
 		rs.broadcastFederationHop(sessionID, exchange)
-		return
+		return fmt.Errorf("federation revoke-subject request: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -750,6 +921,10 @@ func (rs *ReceiverService) revokeFederationSubject(ctx context.Context, sessionI
 	}
 	exchange.Response.Body = string(body)
 	rs.broadcastFederationHop(sessionID, exchange)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("federation revoke-subject returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func (rs *ReceiverService) broadcastFederationHop(sessionID string, exchange *CapturedHTTPExchange) {
@@ -836,7 +1011,10 @@ func (rs *ReceiverService) handleClearLogs(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ClearLogs clears received events, response actions, and JTI replay cache
+// ClearLogs clears only the received/actions display records. Replay protection
+// is intentionally NOT touched: durable set_processing rows in SQLite (and the
+// in-memory fallback) keep rejecting already-processed jtis, so clearing the
+// display logs can never make the same SET take effect again.
 func (rs *ReceiverService) ClearLogs() {
 	rs.eventsMu.Lock()
 	rs.receivedEvents = make([]ReceivedEvent, 0)
@@ -845,10 +1023,6 @@ func (rs *ReceiverService) ClearLogs() {
 	rs.actionsMu.Lock()
 	rs.responseActions = make([]ResponseAction, 0)
 	rs.actionsMu.Unlock()
-
-	rs.seenJTIsMu.Lock()
-	rs.seenJTIs = make(map[string]time.Time)
-	rs.seenJTIsMu.Unlock()
 }
 
 // writeReceiverSSFError writes an error response per RFC 8935 §2.3.

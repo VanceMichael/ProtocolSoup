@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -131,6 +132,32 @@ func (s *Storage) initSchema() error {
 		FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
 	);
 
+	-- Receiver-side SET processing ownership, per-step progress and final outcome.
+	-- Keyed by jti (RFC 8417 §2.2) so concurrent/redelivered SETs have exactly one
+	-- executor. Rows are durable replay protection: they survive ClearLogs and
+	-- ReceiverService rebuilds and are never deleted by display-log maintenance.
+	CREATE TABLE IF NOT EXISTS set_processing (
+		jti TEXT PRIMARY KEY,
+		issuer TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL,
+		owner_id TEXT NOT NULL DEFAULT '',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		error_code TEXT NOT NULL DEFAULT '',
+		error_description TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		completed_at DATETIME
+	);
+
+	-- Successfully completed side-effect steps of a SET. A retry resumes from the
+	-- first missing step, so already-succeeded actions never run a second time.
+	CREATE TABLE IF NOT EXISTS set_processing_steps (
+		jti TEXT NOT NULL,
+		step TEXT NOT NULL,
+		completed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (jti, step)
+	);
+
 	-- SSF §8.1.3 subject membership. default_subjects ALL: excluded=1 means do not transmit.
 	CREATE TABLE IF NOT EXISTS stream_subject_membership (
 		id TEXT PRIMARY KEY,
@@ -147,6 +174,7 @@ func (s *Storage) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_subjects_stream ON subjects(stream_id);
 	CREATE INDEX IF NOT EXISTS idx_security_states_stream ON security_states(stream_id);
 	CREATE INDEX IF NOT EXISTS idx_security_states_identifier ON security_states(identifier);
+	CREATE INDEX IF NOT EXISTS idx_set_processing_status ON set_processing(status);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -827,6 +855,174 @@ func (s *Storage) RecordDeliveryAttempt(ctx context.Context, eventID string, att
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		eventID, attemptNum, status, responseCode, responseBody, errorMsg)
 	return err
+}
+
+// SET processing status values for set_processing.status.
+const (
+	SETStatusProcessing = "processing" // execution owned, may be in flight or resumable
+	SETStatusSucceeded  = "succeeded"  // all side effects completed; jti is now replay-locked
+	SETStatusFailed     = "failed"     // deterministic retry point: completed steps are durable
+)
+
+// ClaimSETProcessing outcomes.
+const (
+	SETClaimClaimed   = "claimed"   // caller owns execution; completed lists already-done steps
+	SETClaimBusy      = "busy"      // the same receiver instance is actively executing the jti
+	SETClaimDuplicate = "duplicate" // jti already completed; the SET MUST be rejected
+)
+
+// SETProcessing is the receiver-side processing record of one jti.
+type SETProcessing struct {
+	JTI              string
+	Issuer           string
+	Status           string
+	OwnerID          string
+	Attempts         int
+	ErrorCode        string
+	ErrorDescription string
+	CompletedSteps   []string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	CompletedAt      *time.Time
+}
+
+// ClaimSETProcessing atomically claims exclusive execution ownership of a verified SET.
+//
+// A new jti is inserted in 'processing' state. A 'failed' row is resumed (the
+// failure was a deterministic retry point). A 'processing' row is resumed when it
+// belongs to a different owner (a crashed/rebuilt ReceiverService) or when
+// activeLocally is false (a previous attempt on this instance already ended, e.g.
+// after a progress-write failure); it is reported busy only when the same instance
+// is genuinely executing it right now. A 'succeeded' row is a duplicate and must
+// never take effect again.
+//
+// completed returns the durable set of already-succeeded step keys to resume from.
+func (s *Storage) ClaimSETProcessing(ctx context.Context, jti, issuer, ownerID string, activeLocally bool) (outcome string, completed []string, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	defer tx.Rollback()
+
+	var status, existingOwner string
+	var attempts int
+	scanErr := tx.QueryRowContext(ctx,
+		`SELECT status, owner_id, attempts FROM set_processing WHERE jti = ?`, jti).
+		Scan(&status, &existingOwner, &attempts)
+
+	switch {
+	case errors.Is(scanErr, sql.ErrNoRows):
+		if _, err = tx.ExecContext(ctx, `
+			INSERT INTO set_processing (jti, issuer, status, owner_id, attempts)
+			VALUES (?, ?, ?, ?, 1)`,
+			jti, issuer, SETStatusProcessing, ownerID); err != nil {
+			return "", nil, err
+		}
+	case scanErr != nil:
+		return "", nil, scanErr
+	case status == SETStatusSucceeded:
+		return SETClaimDuplicate, nil, nil
+	case status == SETStatusProcessing && existingOwner == ownerID && activeLocally:
+		return SETClaimBusy, nil, nil
+	default:
+		// Resumable: previous attempt failed, was owned by a rebuilt instance, or
+		// ended without reaching a terminal state on this instance.
+		if _, err = tx.ExecContext(ctx, `
+			UPDATE set_processing
+			SET status = ?, owner_id = ?, attempts = attempts + 1,
+			    error_code = '', error_description = '', updated_at = CURRENT_TIMESTAMP
+			WHERE jti = ?`,
+			SETStatusProcessing, ownerID, jti); err != nil {
+			return "", nil, err
+		}
+	}
+
+	completed, err = listCompletedStepsTx(ctx, tx, jti)
+	if err != nil {
+		return "", nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return "", nil, err
+	}
+	return SETClaimClaimed, completed, nil
+}
+
+func listCompletedStepsTx(ctx context.Context, tx *sql.Tx, jti string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT step FROM set_processing_steps WHERE jti = ? ORDER BY completed_at ASC, rowid ASC`, jti)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var steps []string
+	for rows.Next() {
+		var step string
+		if err := rows.Scan(&step); err != nil {
+			return nil, err
+		}
+		steps = append(steps, step)
+	}
+	return steps, rows.Err()
+}
+
+// CompleteSETProcessingStep durably records one succeeded side-effect step.
+// It is idempotent: re-marking the same step is a no-op.
+func (s *Storage) CompleteSETProcessingStep(ctx context.Context, jti, step string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO set_processing_steps (jti, step) VALUES (?, ?)
+		ON CONFLICT(jti, step) DO NOTHING`, jti, step)
+	return err
+}
+
+// CompleteSETProcessing marks a SET fully processed and releases ownership.
+// After this call the jti is permanently locked against replay.
+func (s *Storage) CompleteSETProcessing(ctx context.Context, jti string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE set_processing
+		SET status = ?, owner_id = '', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		WHERE jti = ?`, SETStatusSucceeded, jti)
+	return err
+}
+
+// FailSETProcessing records a deterministic retry point: ownership is released,
+// the error is retained, and completed steps stay durable for resume.
+func (s *Storage) FailSETProcessing(ctx context.Context, jti, errCode, description string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE set_processing
+		SET status = ?, owner_id = '', error_code = ?, error_description = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE jti = ?`, SETStatusFailed, errCode, description, jti)
+	return err
+}
+
+// GetSETProcessing returns the durable processing record of a jti.
+func (s *Storage) GetSETProcessing(ctx context.Context, jti string) (*SETProcessing, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var p SETProcessing
+	var completedAt sql.NullTime
+	if err := tx.QueryRowContext(ctx, `
+		SELECT jti, issuer, status, owner_id, attempts,
+		       error_code, error_description, created_at, updated_at, completed_at
+		FROM set_processing WHERE jti = ?`, jti).Scan(
+		&p.JTI, &p.Issuer, &p.Status, &p.OwnerID, &p.Attempts,
+		&p.ErrorCode, &p.ErrorDescription, &p.CreatedAt, &p.UpdatedAt, &completedAt,
+	); err != nil {
+		return nil, err
+	}
+	steps, err := listCompletedStepsTx(ctx, tx, jti)
+	if err != nil {
+		return nil, err
+	}
+	p.CompletedSteps = steps
+	if completedAt.Valid {
+		p.CompletedAt = &completedAt.Time
+	}
+	return &p, nil
 }
 
 // GetEventHistory retrieves recent events for display

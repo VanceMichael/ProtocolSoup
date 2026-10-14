@@ -45,7 +45,16 @@ func startSSFTestEnv(t *testing.T) *ssfTestEnv {
 	t.Setenv("SSF_RECEIVER_PORT", strconv.Itoa(recvPort))
 	t.Setenv("SSF_RECEIVER_TOKEN", "ssf-test-receiver-token")
 	if os.Getenv("FEDERATION_SERVICE_URL") == "" {
-		t.Setenv("FEDERATION_SERVICE_URL", "http://127.0.0.1:1")
+		// Default to a healthy federation peer: the receiver's session-revoked
+		// federation step is a mandatory side effect, so a black hole would turn
+		// every push into a retryable 503. Failure cases configure their own peer.
+		fed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"sessions_deleted":1}`))
+		}))
+		t.Cleanup(fed.Close)
+		t.Setenv("FEDERATION_SERVICE_URL", fed.URL)
 	}
 
 	keySet, err := crypto.NewKeySet()

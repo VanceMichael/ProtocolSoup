@@ -70,10 +70,20 @@ type SetStatus struct {
 	Status      string `json:"status"`
 	Description string `json:"description,omitempty"`
 	Err         string `json:"err,omitempty"` // RFC 8935 §2.4 / RFC 8936 §2.4 err keyword
+	// HTTPStatus is the push-delivery status a retryable processing failure maps to.
+	// Validation failures keep the default 400 via handlePush. Not serialized on poll.
+	HTTPStatus int `json:"-"`
 }
 
 func failedSET(errCode, description string) SetStatus {
 	return SetStatus{Status: "failed", Description: description, Err: errCode}
+}
+
+// retryableFailedSET is a failure that preserves the SET for deterministic retry:
+// push MUST NOT answer 202 (it answers httpStatus instead) and poll MUST NOT treat
+// the SET as confirmable, so it stays unacknowledged and is re-delivered.
+func retryableFailedSET(errCode, description string, httpStatus int) SetStatus {
+	return SetStatus{Status: "failed", Description: description, Err: errCode, HTTPStatus: httpStatus}
 }
 
 // PollRequest represents an SSF poll request (RFC 8936 §2).
@@ -101,62 +111,146 @@ type PollResponse struct {
 // Shared Event Processing (used by ReceiverService)
 // ====================
 
-// ExecuteResponseActions executes security response actions for a decoded event.
-// Only actions that mutate RP state are marked executed. Generic strings
-// (alert security team, re-evaluate policy) are logged or not_applicable.
-func ExecuteResponseActions(executor ActionExecutor, eventID string, event DecodedEvent, subjectEmail, sessionID string, subject *SETSubject) []ResponseAction {
-	metadata := event.Metadata
-	var actions []ResponseAction
+// Retryable SET processing error codes returned to push/pop deliveries.
+const (
+	SETErrActionExecutionFailed  = "action_execution_failed"
+	SETErrFederationRevokeFailed = "federation_revoke_failed"
+	SETErrProcessingInProgress   = "processing_in_progress"
+	SETErrStorageUnavailable     = "storage_unavailable"
+)
 
-	ctx := context.Background()
-	var mutateErr error
-	mutated := false
-	if executor != nil && subjectEmail != "" {
-		switch event.Type {
-		case EventTypeSessionRevoked:
-			log.Printf("[SSF Receiver] Executing: Revoke sessions for %s (session: %s)", subjectEmail, sessionID)
-			mutateErr = executor.RevokeUserSessionsForSession(ctx, sessionID, subjectEmail)
-			mutated = true
-		case EventTypeAccountDisabled:
-			log.Printf("[SSF Receiver] Executing: Disable user %s (session: %s)", subjectEmail, sessionID)
-			mutateErr = executor.DisableUserForSession(ctx, sessionID, subjectEmail)
-			mutated = true
-		case EventTypeAccountEnabled:
-			log.Printf("[SSF Receiver] Executing: Enable user %s (session: %s)", subjectEmail, sessionID)
-			mutateErr = executor.EnableUserForSession(ctx, sessionID, subjectEmail)
-			mutated = true
-		case EventTypeCredentialCompromise, EventTypeAccountCredentialChangeRequired:
-			log.Printf("[SSF Receiver] Executing: Force password reset for %s (session: %s)", subjectEmail, sessionID)
-			mutateErr = executor.ForcePasswordResetForSession(ctx, sessionID, subjectEmail)
-			if mutateErr == nil {
-				mutateErr = executor.InvalidateTokensForSession(ctx, sessionID, subjectEmail)
-			}
-			if mutateErr == nil {
-				mutateErr = executor.RevokeUserSessionsForSession(ctx, sessionID, subjectEmail)
-			}
-			mutated = true
-		case EventTypeCredentialChange:
-			log.Printf("[SSF Receiver] Executing: Invalidate tokens for %s (session: %s)", subjectEmail, sessionID)
-			mutateErr = executor.InvalidateTokensForSession(ctx, sessionID, subjectEmail)
-			mutated = true
-		case EventTypeAccountPurged:
-			log.Printf("[SSF Receiver] Executing: Disable and revoke for purged %s (session: %s)", subjectEmail, sessionID)
-			mutateErr = executor.DisableUserForSession(ctx, sessionID, subjectEmail)
-			mutated = true
-		case EventTypeDeviceComplianceChange:
-			deviceID := ""
-			if subject != nil {
-				deviceID = subject.DeviceSubject()
-			}
-			log.Printf("[SSF Receiver] Executing: Device compliance for %s device=%s (session: %s)", subjectEmail, deviceID, sessionID)
-			mutateErr = executor.ApplyDeviceComplianceForSession(ctx, sessionID, subjectEmail, deviceID, event.Payload.CurrentStatus)
-			mutated = true
-		}
+// mutationStep is one side effect of a SET that can be executed, durably marked,
+// and individually resumed. Key is stable across retries. Steps run in order and
+// stop at the first error.
+type mutationStep struct {
+	Key     string
+	Label   string
+	ErrCode string
+	run     func(ctx context.Context) error
+}
+
+// planMutationSteps builds the ordered, idempotently-retryable mutation plan for
+// one decoded event. The federation revoke-subject hop of session-revoked is
+// appended separately by the ReceiverService (only when a federation peer is
+// configured). Returns nil for events without RP-state mutations.
+func planMutationSteps(executor ActionExecutor, eventIndex int, event DecodedEvent, subjectEmail, sessionID string, subject *SETSubject) []mutationStep {
+	if executor == nil || subjectEmail == "" {
+		return nil
 	}
 
+	key := func(name string) string {
+		return fmt.Sprintf("e%d:%s", eventIndex, name)
+	}
+
+	switch event.Type {
+	case EventTypeSessionRevoked:
+		return []mutationStep{{
+			Key:     key("revoke-sessions"),
+			Label:   "Revoke sessions",
+			ErrCode: SETErrActionExecutionFailed,
+			run: func(ctx context.Context) error {
+				log.Printf("[SSF Receiver] Executing: Revoke sessions for %s (session: %s)", subjectEmail, sessionID)
+				return executor.RevokeUserSessionsForSession(ctx, sessionID, subjectEmail)
+			},
+		}}
+	case EventTypeAccountDisabled:
+		return []mutationStep{{
+			Key:     key("disable-user"),
+			Label:   "Disable user",
+			ErrCode: SETErrActionExecutionFailed,
+			run: func(ctx context.Context) error {
+				log.Printf("[SSF Receiver] Executing: Disable user %s (session: %s)", subjectEmail, sessionID)
+				return executor.DisableUserForSession(ctx, sessionID, subjectEmail)
+			},
+		}}
+	case EventTypeAccountEnabled:
+		return []mutationStep{{
+			Key:     key("enable-user"),
+			Label:   "Enable user",
+			ErrCode: SETErrActionExecutionFailed,
+			run: func(ctx context.Context) error {
+				log.Printf("[SSF Receiver] Executing: Enable user %s (session: %s)", subjectEmail, sessionID)
+				return executor.EnableUserForSession(ctx, sessionID, subjectEmail)
+			},
+		}}
+	case EventTypeCredentialCompromise, EventTypeAccountCredentialChangeRequired:
+		// Three sequential containment steps; each is its own retry checkpoint.
+		return []mutationStep{
+			{
+				Key:     key("force-password-reset"),
+				Label:   "Force password reset",
+				ErrCode: SETErrActionExecutionFailed,
+				run: func(ctx context.Context) error {
+					log.Printf("[SSF Receiver] Executing: Force password reset for %s (session: %s)", subjectEmail, sessionID)
+					return executor.ForcePasswordResetForSession(ctx, sessionID, subjectEmail)
+				},
+			},
+			{
+				Key:     key("invalidate-tokens"),
+				Label:   "Invalidate tokens",
+				ErrCode: SETErrActionExecutionFailed,
+				run: func(ctx context.Context) error {
+					log.Printf("[SSF Receiver] Executing: Invalidate tokens for %s (session: %s)", subjectEmail, sessionID)
+					return executor.InvalidateTokensForSession(ctx, sessionID, subjectEmail)
+				},
+			},
+			{
+				Key:     key("revoke-sessions"),
+				Label:   "Revoke sessions",
+				ErrCode: SETErrActionExecutionFailed,
+				run: func(ctx context.Context) error {
+					log.Printf("[SSF Receiver] Executing: Revoke sessions for %s (session: %s)", subjectEmail, sessionID)
+					return executor.RevokeUserSessionsForSession(ctx, sessionID, subjectEmail)
+				},
+			},
+		}
+	case EventTypeCredentialChange:
+		return []mutationStep{{
+			Key:     key("invalidate-tokens"),
+			Label:   "Invalidate tokens",
+			ErrCode: SETErrActionExecutionFailed,
+			run: func(ctx context.Context) error {
+				log.Printf("[SSF Receiver] Executing: Invalidate tokens for %s (session: %s)", subjectEmail, sessionID)
+				return executor.InvalidateTokensForSession(ctx, sessionID, subjectEmail)
+			},
+		}}
+	case EventTypeAccountPurged:
+		return []mutationStep{{
+			Key:     key("disable-user"),
+			Label:   "Disable and purge user",
+			ErrCode: SETErrActionExecutionFailed,
+			run: func(ctx context.Context) error {
+				log.Printf("[SSF Receiver] Executing: Disable and revoke for purged %s (session: %s)", subjectEmail, sessionID)
+				return executor.DisableUserForSession(ctx, sessionID, subjectEmail)
+			},
+		}}
+	case EventTypeDeviceComplianceChange:
+		deviceID := ""
+		if subject != nil {
+			deviceID = subject.DeviceSubject()
+		}
+		return []mutationStep{{
+			Key:     key("device-compliance"),
+			Label:   "Apply device compliance",
+			ErrCode: SETErrActionExecutionFailed,
+			run: func(ctx context.Context) error {
+				log.Printf("[SSF Receiver] Executing: Device compliance for %s device=%s (session: %s)", subjectEmail, deviceID, sessionID)
+				return executor.ApplyDeviceComplianceForSession(ctx, sessionID, subjectEmail, deviceID, event.Payload.CurrentStatus)
+			},
+		}}
+	default:
+		return nil
+	}
+}
+
+// buildResponseActions builds the display-only action rows for an event from its
+// metadata. mutated/mutateErr describe the outcome of the event's mutation plan.
+// Generic descriptions (alert security team, re-evaluate policy) are logged or
+// not_applicable; only RP-state mutations are marked executed/failed.
+func buildResponseActions(eventID string, event DecodedEvent, sessionID string, mutated bool, mutateErr error) []ResponseAction {
+	var actions []ResponseAction
 	primaryMarked := false
-	for i, actionDesc := range metadata.ResponseActions {
-		executedAt := time.Now()
+	for i, actionDesc := range event.Metadata.ResponseActions {
 		status := actionStatusForDescription(actionDesc)
 		if mutated && isPrimaryMutationAction(actionDesc) && !primaryMarked {
 			if mutateErr != nil {
@@ -174,16 +268,27 @@ func ExecuteResponseActions(executor ActionExecutor, eventID string, event Decod
 			Action:      actionDesc,
 			Description: fmt.Sprintf("Automated response: %s (session: %s)", actionDesc, sessionID),
 			Status:      status,
-			ExecutedAt:  executedAt,
+			ExecutedAt:  time.Now(),
 			SessionID:   sessionID,
 		})
 	}
-
-	if mutateErr != nil {
-		log.Printf("[SSF Receiver] Action failed: %v", mutateErr)
-	}
-
 	return actions
+}
+
+// ExecuteResponseActions executes security response actions for a decoded event
+// and returns its display rows. The durable, resumable processing path lives in
+// ReceiverService.processSET; this helper is retained for callers that execute a
+// plan without SET-processing persistence. Steps stop at the first error.
+func ExecuteResponseActions(executor ActionExecutor, eventID string, event DecodedEvent, subjectEmail, sessionID string, subject *SETSubject) []ResponseAction {
+	steps := planMutationSteps(executor, 0, event, subjectEmail, sessionID, subject)
+	var mutateErr error
+	for _, step := range steps {
+		if mutateErr = step.run(context.Background()); mutateErr != nil {
+			log.Printf("[SSF Receiver] Action failed at step %s: %v", step.Key, mutateErr)
+			break
+		}
+	}
+	return buildResponseActions(eventID, event, sessionID, len(steps) > 0, mutateErr)
 }
 
 func isPrimaryMutationAction(desc string) bool {
