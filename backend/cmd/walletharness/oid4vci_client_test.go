@@ -388,9 +388,9 @@ func TestShouldUseHAIPIssuancePathForExternalAttestedAS(t *testing.T) {
 	t.Parallel()
 	server := &walletHarnessServer{}
 	asMetadata := &resolvedAuthorizationServerMetadata{
-		TokenEndpointAuthMethodsSupported:   []string{"attest_jwt_client_auth"},
-		RequirePushedAuthorizationRequests:  true,
-		DPoPSigningAlgValuesSupported:       []string{"ES256"},
+		TokenEndpointAuthMethodsSupported:  []string{"attest_jwt_client_auth"},
+		RequirePushedAuthorizationRequests: true,
+		DPoPSigningAlgValuesSupported:      []string{"ES256"},
 	}
 	if !server.shouldUseHAIPIssuancePath("org.iso.18013.5.1.mDL", nil, asMetadata) {
 		t.Fatal("expected HAIP path for attested PAR AS regardless of configuration id naming")

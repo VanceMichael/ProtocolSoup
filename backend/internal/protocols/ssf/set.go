@@ -11,13 +11,13 @@ import (
 
 // SETSubject represents the subject identifier in a SET
 type SETSubject struct {
-	Format      string `json:"format"`
-	Email       string `json:"email,omitempty"`
-	PhoneNumber string `json:"phone_number,omitempty"`
-	Issuer      string `json:"iss,omitempty"`
-	Subject     string `json:"sub,omitempty"`
-	ID          string `json:"id,omitempty"`
-	URI         string `json:"uri,omitempty"`
+	Format      string      `json:"format"`
+	Email       string      `json:"email,omitempty"`
+	PhoneNumber string      `json:"phone_number,omitempty"`
+	Issuer      string      `json:"iss,omitempty"`
+	Subject     string      `json:"sub,omitempty"`
+	ID          string      `json:"id,omitempty"`
+	URI         string      `json:"uri,omitempty"`
 	User        *SETSubject `json:"user,omitempty"`
 	Device      *SETSubject `json:"device,omitempty"`
 	Session     *SETSubject `json:"session,omitempty"`
@@ -86,7 +86,7 @@ type EventPayload struct {
 	PreviousStatus   string                 `json:"previous_status,omitempty"`
 	CurrentLevel     string                 `json:"current_level,omitempty"` // For assurance level change (CAEP §3.4)
 	PreviousLevel    string                 `json:"previous_level,omitempty"`
-	Namespace        string                 `json:"namespace,omitempty"`     // CAEP §3.4 REQUIRED
+	Namespace        string                 `json:"namespace,omitempty"` // CAEP §3.4 REQUIRED
 	NewValue         string                 `json:"new-value,omitempty"`
 	OldValue         string                 `json:"old-value,omitempty"`
 	Claims           map[string]interface{} `json:"claims,omitempty"` // CAEP §3.2: changed claims

@@ -18,10 +18,10 @@ import (
 // Plugin implements the SCIM 2.0 protocol plugin
 type Plugin struct {
 	*plugin.BasePlugin
-	storage      *Storage
-	lookingGlass *lookingglass.Engine
-	baseURL      string
-	client       *Client
+	storage       *Storage
+	lookingGlass  *lookingglass.Engine
+	baseURL       string
+	client        *Client
 	retentionStop context.CancelFunc
 	retentionWG   sync.WaitGroup
 }

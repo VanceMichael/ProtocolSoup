@@ -33,13 +33,13 @@ type Plugin struct {
 
 	// Authorization server used to validate Stream Management access tokens.
 	// [CAEPINTEROP] §2.7: the AS MAY be a different entity from the Transmitter.
-	asIssuer     string
-	asJWKSURI    string
-	asAudience   string
-	jwksFetch    *crypto.JWKSFetcher
-	revoker      tokenRevoker
+	asIssuer      string
+	asJWKSURI     string
+	asAudience    string
+	jwksFetch     *crypto.JWKSFetcher
+	revoker       tokenRevoker
 	introspectURL string
-	minVerifyInt int // seconds; SSF §8.1.1 min_verification_interval
+	minVerifyInt  int // seconds; SSF §8.1.1 min_verification_interval
 }
 
 // NewPlugin creates a new SSF plugin

@@ -418,6 +418,16 @@ paths:
         report is valid for this build, a verdict summary. `commit` and
         `generated_at` are omitted unless `report_valid` is true.
       operationId: listConformanceSpecs
+      parameters:
+        - in: header
+          name: If-None-Match
+          required: false
+          schema:
+            type: string
+          description: >-
+            Returns 304 Not Modified when it matches the active report
+            generation's ETag (or `*`); the active generation is unchanged by
+            a rejected SIGHUP reload.
       responses:
         "200":
           description: Specification summaries.
@@ -426,10 +436,20 @@ paths:
               schema:
                 type: string
                 const: public, max-age=300
+            ETag:
+              schema:
+                type: string
+              description: >-
+                Opaque validator identifying the report generation the
+                response was built from (`"conformance-g<n>"`, `"conformance-g0"`
+                when no report is active). The same generation number appears
+                in /health.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ConformanceSpecsResponse"
+        "304":
+          description: The active generation matches If-None-Match.
   /api/conformance/specs/{specId}:
     get:
       tags: [Conformance]
@@ -447,6 +467,12 @@ paths:
           schema:
             type: string
           example: oid4vp
+        - in: header
+          name: If-None-Match
+          required: false
+          schema:
+            type: string
+          description: Returns 304 when it matches the active generation's ETag (or `*`).
       responses:
         "200":
           description: Specification with requirement rows.
@@ -455,10 +481,16 @@ paths:
               schema:
                 type: string
                 const: public, max-age=300
+            ETag:
+              schema:
+                type: string
+              description: Report generation validator (`"conformance-g<n>"`).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ConformanceSpecResponse"
+        "304":
+          description: The active generation matches If-None-Match.
         "404":
           description: Unknown specification, or one with no requirements.
           content:
@@ -484,6 +516,12 @@ paths:
           schema:
             type: string
           example: VP-001
+        - in: header
+          name: If-None-Match
+          required: false
+          schema:
+            type: string
+          description: Returns 304 when it matches the active generation's ETag (or `*`).
       responses:
         "200":
           description: Requirement detail.
@@ -492,10 +530,16 @@ paths:
               schema:
                 type: string
                 const: public, max-age=300
+            ETag:
+              schema:
+                type: string
+              description: Report generation validator (`"conformance-g<n>"`).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ConformanceRequirementResponse"
+        "304":
+          description: The active generation matches If-None-Match.
         "404":
           description: Unknown requirement.
           content:
@@ -513,6 +557,13 @@ paths:
         explainer exists. `lastmod` is the report's `generated_at`. The
         array is empty when nothing is indexable.
       operationId: getConformanceSitemap
+      parameters:
+        - in: header
+          name: If-None-Match
+          required: false
+          schema:
+            type: string
+          description: Returns 304 when it matches the active generation's ETag (or `*`).
       responses:
         "200":
           description: Indexable pages.
@@ -521,12 +572,20 @@ paths:
               schema:
                 type: string
                 const: public, max-age=300
+            ETag:
+              schema:
+                type: string
+              description: >-
+                Report generation validator (`"conformance-g<n>"`); rejected
+                SIGHUP reloads keep the previous generation's validator.
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/ConformanceSitemapEntry"
+        "304":
+          description: The active generation matches If-None-Match.
   /ws/lookingglass/{session}:
     get:
       tags: [LookingGlass]

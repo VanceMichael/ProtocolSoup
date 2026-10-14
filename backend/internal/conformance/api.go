@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -117,7 +118,53 @@ func (c *Catalogue) Routes() chi.Router {
 	return r
 }
 
-func (c *Catalogue) specSummary(spec Specification) SpecSummary {
+// generationETag is the cache validator identifying the generation a
+// response was built from ("conformance-g0" for the static, unevaluated
+// view). Every conformance response carries it so caches and operators can
+// tell which active generation they are seeing; rejected reloads keep the
+// previous generation's validator.
+func generationETag(g *generation) string {
+	id := uint64(0)
+	if g != nil {
+		id = g.id
+	}
+	return fmt.Sprintf("\"conformance-g%d\"", id)
+}
+
+// ifNoneMatch reports whether If-None-Match selects etag, including the
+// wildcard form (RFC 9110 Section 13.1.2).
+func ifNoneMatch(r *http.Request, etag string) bool {
+	header := strings.TrimSpace(r.Header.Get("If-None-Match"))
+	if header == "" {
+		return false
+	}
+	if header == "*" {
+		return true
+	}
+	for _, candidate := range strings.Split(header, ",") {
+		if strings.TrimSpace(candidate) == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// respondNotModified answers 304 when the client already holds g, carrying
+// the same cache validator a fresh 200 would. It returns false when the
+// response must still be rendered.
+func (c *Catalogue) respondNotModified(w http.ResponseWriter, r *http.Request, g *generation) bool {
+	etag := generationETag(g)
+	if !ifNoneMatch(r, etag) {
+		return false
+	}
+	header := w.Header()
+	header.Set("Cache-Control", cacheControl)
+	header.Set("ETag", etag)
+	w.WriteHeader(http.StatusNotModified)
+	return true
+}
+
+func (c *Catalogue) specSummary(g *generation, spec Specification) SpecSummary {
 	return SpecSummary{
 		ID:               spec.ID,
 		ShortTitle:       spec.ShortTitle,
@@ -125,31 +172,28 @@ func (c *Catalogue) specSummary(spec Specification) SpecSummary {
 		Version:          spec.Version,
 		URL:              spec.URL,
 		RequirementCount: len(c.bySpec[spec.ID]),
-		Verdicts:         c.VerdictSummary(spec.ID),
-		Indexable:        c.SpecIndexable(spec.ID),
+		Verdicts:         c.verdictSummaryFor(g, spec.ID),
+		Indexable:        c.specIndexableFor(g, spec.ID),
 	}
 }
 
-func (c *Catalogue) provenance() (commit, generatedAt string) {
-	if !c.ReportValid() {
-		return "", ""
+func (c *Catalogue) handleSpecs(w http.ResponseWriter, r *http.Request) {
+	g := c.active.Load()
+	if c.respondNotModified(w, r, g) {
+		return
 	}
-	return c.report.Commit, c.report.GeneratedAt
-}
-
-func (c *Catalogue) handleSpecs(w http.ResponseWriter, _ *http.Request) {
-	commit, generatedAt := c.provenance()
+	commit, generatedAt := g.provenance()
 	response := SpecsResponse{
-		ReportValid:    c.ReportValid(),
-		LaunchGateOpen: c.LaunchGateOpen(),
+		ReportValid:    g.isValid(),
+		LaunchGateOpen: g.isGateOpen(),
 		Commit:         commit,
 		GeneratedAt:    generatedAt,
 		Specs:          make([]SpecSummary, 0, len(c.specs)),
 	}
 	for _, spec := range c.specs {
-		response.Specs = append(response.Specs, c.specSummary(spec))
+		response.Specs = append(response.Specs, c.specSummary(g, spec))
 	}
-	writeJSON(w, http.StatusOK, response)
+	writeGenerationJSON(w, http.StatusOK, g, response)
 }
 
 func (c *Catalogue) handleSpec(w http.ResponseWriter, r *http.Request) {
@@ -158,11 +202,15 @@ func (c *Catalogue) handleSpec(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "specification not found"})
 		return
 	}
-	commit, generatedAt := c.provenance()
+	g := c.active.Load()
+	if c.respondNotModified(w, r, g) {
+		return
+	}
+	commit, generatedAt := g.provenance()
 	response := SpecResponse{
-		SpecSummary:    c.specSummary(spec),
-		ReportValid:    c.ReportValid(),
-		LaunchGateOpen: c.LaunchGateOpen(),
+		SpecSummary:    c.specSummary(g, spec),
+		ReportValid:    g.isValid(),
+		LaunchGateOpen: g.isGateOpen(),
 		Commit:         commit,
 		GeneratedAt:    generatedAt,
 		Requirements:   make([]RequirementRow, 0, len(c.bySpec[spec.ID])),
@@ -174,14 +222,14 @@ func (c *Catalogue) handleSpec(w http.ResponseWriter, r *http.Request) {
 			Section:   req.Section,
 			Level:     req.Level,
 			Roles:     req.Roles,
-			Indexable: c.Indexable(req.ID),
+			Indexable: c.indexableFor(g, req.ID),
 		}
-		if result, ok := c.Result(req.ID); ok {
+		if result, ok := c.resultFor(g, req.ID); ok {
 			row.Verdict = result.Verdict
 		}
 		response.Requirements = append(response.Requirements, row)
 	}
-	writeJSON(w, http.StatusOK, response)
+	writeGenerationJSON(w, http.StatusOK, g, response)
 }
 
 func (c *Catalogue) handleRequirement(w http.ResponseWriter, r *http.Request) {
@@ -191,11 +239,15 @@ func (c *Catalogue) handleRequirement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec, _ := c.Specification(req.Specification)
-	commit, generatedAt := c.provenance()
+	g := c.active.Load()
+	if c.respondNotModified(w, r, g) {
+		return
+	}
+	commit, generatedAt := g.provenance()
 
 	response := RequirementResponse{
 		ID:             req.ID,
-		Specification:  c.specSummary(spec),
+		Specification:  c.specSummary(g, spec),
 		Section:        req.Section,
 		SectionURL:     c.registry.SectionURL(req),
 		Level:          req.Level,
@@ -209,11 +261,11 @@ func (c *Catalogue) handleRequirement(w http.ResponseWriter, r *http.Request) {
 		Implementation: req.Implementation,
 		ADR:            req.ADR,
 		Notes:          req.Notes,
-		Indexable:      c.Indexable(req.ID),
+		Indexable:      c.indexableFor(g, req.ID),
 		Siblings:       []RequirementLink{},
 	}
 
-	result, hasResult := c.Result(req.ID)
+	result, hasResult := c.resultFor(g, req.ID)
 	if hasResult {
 		response.Verdict = result.Verdict
 		response.SourceBaseURL = SourceRepository + "/blob/" + commit + "/"
@@ -245,30 +297,34 @@ func (c *Catalogue) handleRequirement(w http.ResponseWriter, r *http.Request) {
 	if next != nil {
 		response.Next = &RequirementLink{ID: next.ID, Title: next.Title}
 	}
-	writeJSON(w, http.StatusOK, response)
+	writeGenerationJSON(w, http.StatusOK, g, response)
 }
 
-func (c *Catalogue) handleSitemap(w http.ResponseWriter, _ *http.Request) {
-	entries := c.Sitemap()
-	writeJSON(w, http.StatusOK, entries)
+func (c *Catalogue) handleSitemap(w http.ResponseWriter, r *http.Request) {
+	g := c.active.Load()
+	if c.respondNotModified(w, r, g) {
+		return
+	}
+	writeGenerationJSON(w, http.StatusOK, g, c.sitemapFor(g))
 }
 
-// Sitemap lists indexable specification and requirement pages. lastmod is
-// the report generation time (sitemaps.org 0.9 W3C Datetime). It returns an
-// empty, non-nil slice when nothing is indexable.
-func (c *Catalogue) Sitemap() []SitemapEntry {
+// sitemapFor lists indexable specification and requirement pages for one
+// generation. lastmod is that generation's report generation time
+// (sitemaps.org 0.9 W3C Datetime). It returns an empty, non-nil slice when
+// nothing is indexable.
+func (c *Catalogue) sitemapFor(g *generation) []SitemapEntry {
 	entries := []SitemapEntry{}
-	if !c.LaunchGateOpen() {
+	if !g.isGateOpen() {
 		return entries
 	}
-	lastmod := c.report.GeneratedAt
+	lastmod := g.report.GeneratedAt
 	for _, spec := range c.specs {
-		if !c.SpecIndexable(spec.ID) {
+		if !c.specIndexableFor(g, spec.ID) {
 			continue
 		}
 		entries = append(entries, SitemapEntry{Path: "/spec/" + spec.ID, LastMod: lastmod})
 		for _, req := range c.bySpec[spec.ID] {
-			if c.Indexable(req.ID) {
+			if c.indexableFor(g, req.ID) {
 				entries = append(entries, SitemapEntry{Path: RequirementPath(spec.ID, req.ID), LastMod: lastmod})
 			}
 		}
@@ -276,14 +332,27 @@ func (c *Catalogue) Sitemap() []SitemapEntry {
 	return entries
 }
 
+// Sitemap lists indexable pages from the active generation.
+func (c *Catalogue) Sitemap() []SitemapEntry {
+	return c.sitemapFor(c.active.Load())
+}
+
 // RequirementPath is the canonical frontend path for a requirement page.
 func RequirementPath(specID, requirementID string) string {
 	return "/spec/" + specID + "/" + strings.ToLower(requirementID)
 }
 
+func writeGenerationJSON(w http.ResponseWriter, status int, g *generation, body any) {
+	header := w.Header()
+	header.Set("Content-Type", "application/json")
+	header.Set("Cache-Control", cacheControl)
+	header.Set("ETag", generationETag(g))
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", cacheControl)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
 }

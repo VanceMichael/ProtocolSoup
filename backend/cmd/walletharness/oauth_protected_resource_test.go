@@ -26,14 +26,14 @@ func TestStartProtectedResourceAuthorizationBuildsPARAuthorizeURL(t *testing.T) 
 		base := "http://" + r.Host
 		if strings.Contains(r.URL.Path, "oauth-authorization-server") {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"issuer":                                base + "/test",
-				"authorization_endpoint":                base + "/authorize",
-				"token_endpoint":                        base + "/token",
-				"pushed_authorization_request_endpoint": base + "/par",
-				"code_challenge_methods_supported":      []string{"S256"},
-				"dpop_signing_alg_values_supported":     []string{"ES256"},
-				"token_endpoint_auth_methods_supported": []string{"attest_jwt_client_auth"},
-				"require_pushed_authorization_requests": true,
+				"issuer":                                         base + "/test",
+				"authorization_endpoint":                         base + "/authorize",
+				"token_endpoint":                                 base + "/token",
+				"pushed_authorization_request_endpoint":          base + "/par",
+				"code_challenge_methods_supported":               []string{"S256"},
+				"dpop_signing_alg_values_supported":              []string{"ES256"},
+				"token_endpoint_auth_methods_supported":          []string{"attest_jwt_client_auth"},
+				"require_pushed_authorization_requests":          true,
 				"authorization_response_iss_parameter_supported": true,
 			})
 			return

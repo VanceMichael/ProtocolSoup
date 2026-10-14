@@ -115,9 +115,32 @@ func main() {
 	log.Printf("Initialized %d protocol plugins", len(registry.List()))
 
 	// Create and configure server
+	catalogue := loadConformanceCatalogue(bootstrap.Config, bootstrap.Palette)
 	server := core.NewServer(bootstrap.Config, registry, bootstrap.LookingGlass, bootstrap.KeySet).
 		WithPalette(bootstrap.Palette).
-		WithConformance(loadConformanceCatalogue(bootstrap.Config, bootstrap.Palette))
+		WithConformance(catalogue)
+
+	// A self-hosted operator replaces CONFORMANCE_REPORT in place (the
+	// conformance-report command swaps it atomically) and sends SIGHUP to
+	// evaluate the new evidence without a restart. SIGHUP is only captured
+	// when a report path is configured, so processes without one keep the
+	// default signal disposition. A rejected candidate keeps serving the
+	// last active generation; see conformance.Catalogue.Reload.
+	if catalogue != nil && catalogue.ReportPath() != "" {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				switch outcome := catalogue.Reload(); {
+				case outcome.Err != nil:
+					log.Printf("SIGHUP: conformance report rejected, keeping generation %d: %v", outcome.GenerationID, outcome.Err)
+				case outcome.Activated:
+					log.Printf("SIGHUP: conformance report activated as generation %d (commit %s, generated %s)", outcome.GenerationID, outcome.Commit, outcome.GeneratedAt)
+				}
+			}
+		}()
+	}
+
 	httpServer := &http.Server{
 		Addr:         bootstrap.Config.ListenAddr,
 		Handler:      server.Router(),
@@ -162,9 +185,11 @@ func main() {
 }
 
 // loadConformanceCatalogue builds the requirement catalogue from the embedded
-// registry and, when configured and readable, the build's conformance
-// report. A missing or unusable report is logged once and never blocks
-// boot: pages then render "Not evaluated for this build".
+// registry and performs the initial report load with the same candidate rules
+// a SIGHUP reload uses. A missing, unreadable, dirty or build-mismatched
+// report is logged once and never blocks boot: pages then render "Not
+// evaluated for this build", and a later SIGHUP can perform the first
+// activation once a valid file is in place.
 //
 // The palette service supplies requirement explainers (spec-assertion
 // artefacts). When the palette is disabled no requirement has an explainer,
@@ -176,25 +201,22 @@ func loadConformanceCatalogue(cfg *core.Config, explainers *palette.Service) *co
 		return nil
 	}
 
-	var report *conformance.Report
-	if cfg.ConformanceReportPath == "" {
-		log.Println("Conformance report not configured (CONFORMANCE_REPORT); requirement pages will show no verdicts")
-	} else if loaded, err := conformance.LoadReport(cfg.ConformanceReportPath); err != nil {
-		log.Printf("Conformance report unavailable at %s: %v; requirement pages will show no verdicts", cfg.ConformanceReportPath, err)
-	} else {
-		report = loaded
-	}
-
 	// A nil *palette.Service must become a nil interface, not an interface
 	// holding a nil pointer, or the catalogue would call through it.
 	var source conformance.ExplainerSource
 	if explainers != nil {
 		source = explainers
 	}
-	catalogue := conformance.NewCatalogue(registry, report, cfg.BuildCommit, source)
-	if report != nil && !catalogue.ReportValid() {
-		log.Printf("Conformance report at %s does not match this build (report commit %q, dirty=%t, BUILD_COMMIT %q); requirement pages will show no verdicts",
-			cfg.ConformanceReportPath, report.Commit, report.Dirty, cfg.BuildCommit)
+	catalogue := conformance.NewReloadableCatalogue(registry, cfg.ConformanceReportPath, cfg.BuildCommit, source)
+
+	outcome := catalogue.Reload()
+	switch {
+	case !outcome.Configured:
+		log.Println("Conformance report not configured (CONFORMANCE_REPORT); requirement pages will show no verdicts")
+	case outcome.Err != nil:
+		log.Printf("Conformance report not activated: %v; requirement pages will show no verdicts until a valid file is replaced and SIGHUP is sent", outcome.Err)
+	default:
+		log.Printf("Conformance report active as generation %d (commit %s, generated %s)", outcome.GenerationID, outcome.Commit, outcome.GeneratedAt)
 	}
 	return catalogue
 }

@@ -188,8 +188,8 @@ func (s *walletHarnessServer) resolveAuthorizationServerMetadataFromDiscoveryURL
 		// client MUST stop — do not continue to PAR/authorize/token.
 		if issuer == "" || !sameURLIdentifier(issuer, expectedIssuer) {
 			return nil, &walletAPIError{
-				Status:      http.StatusBadRequest,
-				Code:        "discovery_issuer_mismatch",
+				Status: http.StatusBadRequest,
+				Code:   "discovery_issuer_mismatch",
 				Description: fmt.Sprintf(
 					"discovery issuer %q does not match Issuer URL %q derived from discovery URL (OIDC Discovery §4.3 / RFC 8414 §3.3); stopping",
 					issuer,

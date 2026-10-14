@@ -9,6 +9,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -291,4 +292,66 @@ func requirementVerdict(requirement Requirement, tests []TestResult) Verdict {
 	default:
 		return VerdictPass
 	}
+}
+
+// WriteReport encodes report in the cmd/conformance-report wire format and
+// atomically replaces path. The bytes are fully written to a sibling temp
+// file and fsynced before the rename, so a concurrent reader (for example a
+// SIGHUP reload) can only ever observe the previous complete file or the new
+// complete file, never a partially written one. Any failure before the rename
+// leaves an existing target file untouched.
+func WriteReport(path string, report Report) error {
+	encoded, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	return writeFileAtomic(path, encoded, 0o644)
+}
+
+// writeFileAtomic writes data to path via a same-directory temp file and an
+// atomic rename. The temp file is removed when anything before the rename
+// fails. The parent directory is fsynced after the rename so the replacement
+// survives a crash.
+func writeFileAtomic(path string, data []byte, perm fs.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err = tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// Best-effort durability of the directory entry: a failure here still
+	// leaves the replacement visible, so do not report it.
+	if dirFile, dirErr := os.Open(dir); dirErr == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
 }

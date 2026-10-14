@@ -79,10 +79,10 @@ func failedSET(errCode, description string) SetStatus {
 // PollRequest represents an SSF poll request (RFC 8936 §2).
 // maxEvents 0 is acknowledge-only. Omitted maxEvents defaults at the handler.
 type PollRequest struct {
-	Ack               []string           `json:"ack,omitempty"`
+	Ack               []string            `json:"ack,omitempty"`
 	SetErrs           map[string]SETError `json:"setErrs,omitempty"`
-	MaxEvents         *int               `json:"maxEvents,omitempty"`
-	ReturnImmediately *bool              `json:"returnImmediately,omitempty"`
+	MaxEvents         *int                `json:"maxEvents,omitempty"`
+	ReturnImmediately *bool               `json:"returnImmediately,omitempty"`
 }
 
 // SETError is an RFC 8936 §2.4 setErrs entry.

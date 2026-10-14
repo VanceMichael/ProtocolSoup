@@ -323,12 +323,40 @@ func addVaryAccept(header http.Header) {
 
 // Health check response
 type HealthResponse struct {
-	Status    string               `json:"status"`
-	Version   string               `json:"version"`
-	Commit    string               `json:"commit,omitempty"`
-	Protocols []string             `json:"protocols"`
-	Plugins   []plugin.HealthCheck `json:"plugins"`
-	Palette   *palette.Stats       `json:"palette,omitempty"`
+	Status      string                `json:"status"`
+	Version     string                `json:"version"`
+	Commit      string                `json:"commit,omitempty"`
+	Protocols   []string              `json:"protocols"`
+	Plugins     []plugin.HealthCheck  `json:"plugins"`
+	Palette     *palette.Stats        `json:"palette,omitempty"`
+	Conformance *ConformanceHealth    `json:"conformance,omitempty"`
+}
+
+// ConformanceHealth exposes the active conformance report generation and the
+// outcome of the most recent SIGHUP reload so operators can tell which
+// evidence is serving and why a candidate was last rejected, without
+// restarting the process.
+type ConformanceHealth struct {
+	// Configured reports whether CONFORMANCE_REPORT points at a candidate
+	// file (reloads are possible but still candidate-gated).
+	Configured bool `json:"configured"`
+	// ActiveGeneration is the sequence number of the active generation, 0
+	// when no valid report has ever been activated. The same number appears
+	// in the ETag of every /api/conformance response.
+	ActiveGeneration uint64 `json:"active_generation"`
+	ReportValid      bool   `json:"report_valid"`
+	LaunchGateOpen   bool   `json:"launch_gate_open"`
+	ReportCommit     string `json:"report_commit,omitempty"`
+	ReportGeneratedAt string `json:"report_generated_at,omitempty"`
+	// LastReloadAt is the time of the most recent reload attempt (startup
+	// load included), RFC 3339 UTC.
+	LastReloadAt string `json:"last_reload_at,omitempty"`
+	// LastReloadError is the rejection message from the most recent failed
+	// reload (missing file, corrupt JSON, dirty tree, commit mismatch). It
+	// is cleared by the next successful activation.
+	LastReloadError string `json:"last_reload_error,omitempty"`
+	// LastReloadErrorAt is when LastReloadError was recorded.
+	LastReloadErrorAt string `json:"last_reload_error_at,omitempty"`
 }
 
 // API index response
@@ -390,6 +418,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		stats := s.palette.Stats()
 		resp.Palette = &stats
 	}
+	if s.conformance != nil {
+		resp.Conformance = conformanceHealth(s.conformance.Status())
+	}
 
 	statusCode := http.StatusOK
 	if !s.registry.AllReady() {
@@ -398,6 +429,29 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, statusCode, resp)
+}
+
+// conformanceHealth maps the catalogue's reload snapshot to the /health
+// payload, omitting zero timestamps.
+func conformanceHealth(status conformance.Status) *ConformanceHealth {
+	health := &ConformanceHealth{
+		Configured:        status.Configured,
+		ActiveGeneration:  status.Generation,
+		ReportValid:       status.ReportValid,
+		LaunchGateOpen:    status.LaunchGateOpen,
+		ReportCommit:      status.Commit,
+		ReportGeneratedAt: status.GeneratedAt,
+	}
+	if !status.LastReloadAt.IsZero() {
+		health.LastReloadAt = status.LastReloadAt.Format(time.RFC3339)
+	}
+	if status.LastError != "" {
+		health.LastReloadError = status.LastError
+		if !status.LastErrorAt.IsZero() {
+			health.LastReloadErrorAt = status.LastErrorAt.Format(time.RFC3339)
+		}
+	}
+	return health
 }
 
 // Protocol list response

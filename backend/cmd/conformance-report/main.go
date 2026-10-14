@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -50,16 +49,12 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	report, testErr := conformance.GenerateReport(ctx, registry, repoRoot, backendDir)
-	encoded, err := json.MarshalIndent(report, "", "  ")
-	if err != nil {
-		return err
-	}
-	encoded = append(encoded, '\n')
 
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(outputPath, encoded, 0o644); err != nil {
+	// WriteReport builds the file in a same-directory tempfile and renames it
+	// over the target only once the bytes are complete and fsynced, so an
+	// operator can replace a served CONFORMANCE_REPORT without a reader ever
+	// seeing half a report.
+	if err := conformance.WriteReport(outputPath, report); err != nil {
 		return err
 	}
 	fmt.Printf("conformance-report: wrote %s\n", outputPath)

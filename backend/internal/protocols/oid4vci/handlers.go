@@ -489,8 +489,8 @@ func buildCredentialOfferDeliveryURL(endpoint string, offer models.VCCredentialO
 // part of OpenID4VCI 1.0 Section 4.1.1.
 func marshalCredentialOfferForWire(offer models.VCCredentialOffer) ([]byte, error) {
 	wire := struct {
-		CredentialIssuer           string                        `json:"credential_issuer"`
-		CredentialConfigurationIDs []string                      `json:"credential_configuration_ids"`
+		CredentialIssuer           string                         `json:"credential_issuer"`
+		CredentialConfigurationIDs []string                       `json:"credential_configuration_ids"`
 		Grants                     models.VCCredentialOfferGrants `json:"grants,omitempty"`
 	}{
 		CredentialIssuer:           offer.CredentialIssuer,

@@ -6,6 +6,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // ExplainerSource supplies human-authored explainer markdown for a
@@ -15,21 +17,32 @@ type ExplainerSource interface {
 	Explainer(id string) (markdown string, ok bool)
 }
 
-// Catalogue joins the embedded registry with an optional conformance report
-// and the serving build's commit. It is the single source for everything a
-// requirement page may assert: a verdict is only exposed when the report
-// provably describes the running build.
+// Catalogue joins the embedded registry with the currently active
+// conformance report generation and the serving build's commit. It is the
+// single source for everything a requirement page may assert: a verdict is
+// only exposed when the active generation provably describes the running
+// build.
+//
+// The active generation is an immutable snapshot replaced atomically by
+// Reload (SIGHUP). Handlers snapshot it once per request, so every response
+// comes from one complete generation and reloads never produce mixed views
+// or blank windows: a rejected candidate leaves the previous generation
+// active.
 type Catalogue struct {
 	registry    Registry
-	report      *Report
+	reportPath  string
 	buildCommit string
 	explainers  ExplainerSource
 
-	specs      []Specification              // specs with at least one requirement, registry order
-	specByID   map[string]Specification     // canonical spec ID
-	bySpec     map[string][]Requirement     // canonical spec ID -> requirements in spec order
-	byLowerID  map[string]Requirement       // lowercase requirement ID -> requirement
-	resultByID map[string]RequirementResult // canonical requirement ID -> report result
+	active   atomic.Pointer[generation]
+	reloadMu sync.Mutex
+	nextGenID uint64
+	state    atomic.Pointer[reloadState]
+
+	specs     []Specification          // specs with at least one requirement, registry order
+	specByID  map[string]Specification // canonical spec ID
+	bySpec    map[string][]Requirement // canonical spec ID -> requirements in spec order
+	byLowerID map[string]Requirement   // lowercase requirement ID -> requirement
 }
 
 // LoadReport reads a conformance report written by cmd/conformance-report.
@@ -45,17 +58,15 @@ func LoadReport(path string) (*Report, error) {
 	return &report, nil
 }
 
-// NewCatalogue builds a catalogue. report and explainers may be nil.
-func NewCatalogue(registry Registry, report *Report, buildCommit string, explainers ExplainerSource) *Catalogue {
+// newCatalogue builds the registry-derived, reload-independent indexes.
+func newCatalogue(registry Registry, buildCommit string, explainers ExplainerSource) *Catalogue {
 	c := &Catalogue{
 		registry:    registry,
-		report:      report,
 		buildCommit: strings.TrimSpace(buildCommit),
 		explainers:  explainers,
 		specByID:    make(map[string]Specification, len(registry.Specifications)),
 		bySpec:      make(map[string][]Requirement),
 		byLowerID:   make(map[string]Requirement, len(registry.Requirements)),
-		resultByID:  make(map[string]RequirementResult),
 	}
 	for _, req := range registry.Requirements {
 		c.byLowerID[strings.ToLower(req.ID)] = req
@@ -76,10 +87,18 @@ func NewCatalogue(registry Registry, report *Report, buildCommit string, explain
 		c.specs = append(c.specs, spec)
 		c.specByID[spec.ID] = spec
 	}
-	if report != nil {
-		for _, result := range report.Requirements {
-			c.resultByID[result.ID] = result
-		}
+	return c
+}
+
+// NewCatalogue builds a catalogue from a static report. report and
+// explainers may be nil. A report that does not describe buildCommit (wrong
+// commit, dirty tree) is simply not activated, so pages render "Not
+// evaluated for this build".
+func NewCatalogue(registry Registry, report *Report, buildCommit string, explainers ExplainerSource) *Catalogue {
+	c := newCatalogue(registry, buildCommit, explainers)
+	if reportMatchesBuild(report, c.buildCommit) {
+		c.active.Store(newGeneration(1, registry, report, c.buildCommit))
+		c.nextGenID = 1
 	}
 	return c
 }
@@ -90,41 +109,26 @@ func (c *Catalogue) Registry() Registry { return c.registry }
 // BuildCommit returns the serving build's commit, possibly empty.
 func (c *Catalogue) BuildCommit() string { return c.buildCommit }
 
-// Report returns the loaded report, or nil. Callers must check ReportValid
-// before presenting any verdict from it.
-func (c *Catalogue) Report() *Report { return c.report }
-
-// ReportValid reports whether the loaded report describes the running build:
-// it exists, was generated from a clean tree, and its commit equals the
-// build commit with both non-empty.
-func (c *Catalogue) ReportValid() bool {
-	if c.report == nil || c.report.Dirty {
-		return false
+// Report returns the active report, or nil when no generation is active.
+// Callers must check ReportValid before presenting any verdict from it.
+func (c *Catalogue) Report() *Report {
+	if g := c.active.Load(); g != nil {
+		return g.report
 	}
-	commit := strings.TrimSpace(c.report.Commit)
-	return commit != "" && c.buildCommit != "" && commit == c.buildCommit
+	return nil
 }
 
-// LaunchGateOpen is true when the report is valid and no MUST-family
-// requirement has a verdict of FAIL, MISSING_TEST or CHECK.
+// ReportValid reports whether the active generation describes the running
+// build: it exists, was generated from a clean tree, and its commit equals
+// the build commit with both non-empty.
+func (c *Catalogue) ReportValid() bool {
+	return c.active.Load().isValid()
+}
+
+// LaunchGateOpen is true when the active generation is valid and no
+// MUST-family requirement has a verdict of FAIL, MISSING_TEST or CHECK.
 func (c *Catalogue) LaunchGateOpen() bool {
-	if !c.ReportValid() {
-		return false
-	}
-	for _, req := range c.registry.Requirements {
-		if !IsMustFamily(req.Level) {
-			continue
-		}
-		result, ok := c.resultByID[req.ID]
-		if !ok {
-			return false
-		}
-		switch result.Verdict {
-		case VerdictFail, VerdictMissingTest, VerdictCheck:
-			return false
-		}
-	}
-	return true
+	return c.active.Load().isGateOpen()
 }
 
 // Requirement resolves a requirement ID case-insensitively and returns the
@@ -134,17 +138,22 @@ func (c *Catalogue) Requirement(id string) (Requirement, bool) {
 	return req, ok
 }
 
-// Result returns the report result for a requirement. It is only populated
-// when ReportValid is true, which implements the no-fabricated-verdicts rule.
+// Result returns the active generation's result for a requirement. It is
+// only populated when ReportValid is true, which implements the
+// no-fabricated-verdicts rule.
 func (c *Catalogue) Result(id string) (RequirementResult, bool) {
-	if !c.ReportValid() {
+	return c.resultFor(c.active.Load(), id)
+}
+
+func (c *Catalogue) resultFor(g *generation, id string) (RequirementResult, bool) {
+	if !g.isValid() {
 		return RequirementResult{}, false
 	}
 	req, ok := c.Requirement(id)
 	if !ok {
 		return RequirementResult{}, false
 	}
-	result, ok := c.resultByID[req.ID]
+	result, ok := g.resultByID[req.ID]
 	return result, ok
 }
 
@@ -164,10 +173,14 @@ func (c *Catalogue) Explainer(id string) (string, bool) {
 // gate is open, its verdict is PASS, DEVIATION or N/A, and an explainer
 // exists. Indexability is derived from evidence, never configured.
 func (c *Catalogue) Indexable(id string) bool {
-	if !c.LaunchGateOpen() {
+	return c.indexableFor(c.active.Load(), id)
+}
+
+func (c *Catalogue) indexableFor(g *generation, id string) bool {
+	if !g.isGateOpen() {
 		return false
 	}
-	result, ok := c.Result(id)
+	result, ok := c.resultFor(g, id)
 	if !ok {
 		return false
 	}
@@ -211,11 +224,15 @@ func (c *Catalogue) Requirements(specID string) []Requirement {
 // SpecIndexable reports whether a specification index page may be indexed:
 // the launch gate is open and at least one of its requirements is indexable.
 func (c *Catalogue) SpecIndexable(specID string) bool {
-	if !c.LaunchGateOpen() {
+	return c.specIndexableFor(c.active.Load(), specID)
+}
+
+func (c *Catalogue) specIndexableFor(g *generation, specID string) bool {
+	if !g.isGateOpen() {
 		return false
 	}
 	for _, req := range c.Requirements(specID) {
-		if c.Indexable(req.ID) {
+		if c.indexableFor(g, req.ID) {
 			return true
 		}
 	}
@@ -250,15 +267,19 @@ func (c *Catalogue) Neighbours(id string) (siblings []Requirement, previous, nex
 	return siblings, previous, next
 }
 
-// VerdictSummary counts verdicts across a specification's requirements. It
-// returns nil when the report is not valid for this build.
+// VerdictSummary counts verdicts across a specification's requirements in
+// the active generation. It returns nil when that generation is not valid.
 func (c *Catalogue) VerdictSummary(specID string) map[Verdict]int {
-	if !c.ReportValid() {
+	return c.verdictSummaryFor(c.active.Load(), specID)
+}
+
+func (c *Catalogue) verdictSummaryFor(g *generation, specID string) map[Verdict]int {
+	if !g.isValid() {
 		return nil
 	}
 	summary := make(map[Verdict]int)
 	for _, req := range c.Requirements(specID) {
-		if result, ok := c.resultByID[req.ID]; ok {
+		if result, ok := g.resultByID[req.ID]; ok {
 			summary[result.Verdict]++
 		}
 	}
